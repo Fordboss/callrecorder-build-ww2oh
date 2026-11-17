@@ -1,7 +1,6 @@
 #import "RecorderEngine.h"
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
-#import <AudioToolbox/ExtAudioFile.h>
 
 #import "ATAudioTap.h"
 #import "ATAudioTapDescription.h"
