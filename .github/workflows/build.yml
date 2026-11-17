@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14          # 自带 Xcode 15；若日后下线改成 macos-latest
+    runs-on: macos-latest       # GitHub 托管 macOS runner，通用可用
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
