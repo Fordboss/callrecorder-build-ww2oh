@@ -42,6 +42,11 @@ jobs:
           codesign --force --deep --sign - --timestamp=none \
             --entitlements CallRecorder/CallRecorder.entitlements \
             "build/Payload/$APPNAME"
+          # 验证签名与权限是否真正嵌入
+          echo "=== 签名验证 ==="
+          codesign -dv "build/Payload/$APPNAME" 2>&1 | head -20 || true
+          echo "=== 嵌入的 entitlements ==="
+          codesign -d --entitlements :- "build/Payload/$APPNAME" 2>/dev/null || echo "(无法读取 entitlements)"
           cd build
           zip -qry CallRecorder.ipa Payload
           echo "IPA 大小："
