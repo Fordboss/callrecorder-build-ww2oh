@@ -1,0 +1,50 @@
+name: 编译通话录音机 IPA (巨魔可用)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-14          # 自带 Xcode 15；若日后下线改成 macos-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成工程
+        run: xcodegen generate --spec project.yml
+
+      - name: 编译（不签名，签名在下一步统一做）
+        run: |
+          xcodebuild clean archive \
+            -project CallRecorder.xcodeproj \
+            -scheme CallRecorder \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/CallRecorder.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: 打包 + ad-hoc 签名（带私有权限 entitlements）
+        run: |
+          mkdir -p build/Payload
+          cp -R "$PWD/build/CallRecorder.xcarchive/Products/Applications/CallRecorder.app" build/Payload/
+          # 用 ad-hoc 签名并嵌入 entitlements —— 巨魔安装时靠 CoreTrust 漏洞坐实这些权限
+          codesign --force --sign - --timestamp=none \
+            --entitlements CallRecorder/CallRecorder.entitlements \
+            build/Payload/CallRecorder.app
+          cd build
+          zip -qry CallRecorder.ipa Payload
+          echo "IPA 大小："
+          ls -lh CallRecorder.ipa
+
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallRecorder-IPA
+          path: build/CallRecorder.ipa
+          if-no-files-found: error
+          retention-days: 30
