@@ -225,7 +225,7 @@ commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndex
         [self loadFiles];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    sheet.popoverPresentationController.sourceCell = [tableView cellForRowAtIndexPath:indexPath];
+    sheet.popoverPresentationController.sourceView = [tableView cellForRowAtIndexPath:indexPath];
     [self presentViewController:sheet animated:YES completion:nil];
 }
 
