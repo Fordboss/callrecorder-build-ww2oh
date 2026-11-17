@@ -31,3 +31,9 @@ targets:
       INFOPLIST_FILE: CallRecorder/Info.plist
       PRODUCT_BUNDLE_IDENTIFIER: com.wb.callrecorder
       CODE_SIGN_ENTITLEMENTS: CallRecorder/CallRecorder.entitlements
+    frameworks:
+      - SDK: AudioToolbox.framework
+      - SDK: AVFoundation.framework
+      - SDK: CoreTelephony.framework
+      - SDK: Foundation.framework
+      - SDK: UIKit.framework
