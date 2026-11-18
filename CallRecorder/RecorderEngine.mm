@@ -160,6 +160,11 @@ static BOOL CRMixWavToStereo(NSURL *aURL, NSURL *bURL, NSURL *outURL,
     UInt64                      totalBytes;
     BOOL                        running;
     BOOL                        stopRequested;   // v9.3: 只有显式停止才不再入队
+    char                        wavDir[512];     // v9.5 常驻滚动：目录
+    char                        wavStem[128];    // v9.5 常驻滚动：文件名主干
+    int                         wavPart;         // v9.5 当前段序号
+    UInt64                      wavRollFrames;   // v9.5 滚动阈值（帧）
+    BOOL                        wavRolling;      // v9.5 是否启用滚动
 }
 @end
 @implementation CaptureChannel
@@ -363,6 +368,31 @@ static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, UInt64
 
 #pragma mark 采集回调
 
+// v9.5 ★常驻滚动：队列 / AVAudioSession 全程不重启，只在回调内部换一个 WAV 文件。
+// 正在写入的文件带 .part 后缀（列表不显示）；滚动时回填头、fclose 再 rename 成 .wav，
+// 因此列表里出现的每个文件都是「头已回填、可直接播放」的成品。
+static void CRWavRollIfNeeded(CaptureChannel *ch) {
+    if (!ch->wav || !ch->wavRolling || ch->wavRollFrames == 0) return;
+    if (ch->wavFrames < ch->wavRollFrames) return;
+    CRWavFinalize(ch->wav, ch->wavFrames, 1);
+    fclose(ch->wav);
+    ch->wav = NULL;
+    char cur[768], fin[768];
+    snprintf(cur, sizeof(cur), "%s/%s_p%03d.wav.part", ch->wavDir, ch->wavStem, ch->wavPart);
+    snprintf(fin, sizeof(fin), "%s/%s_p%03d.wav", ch->wavDir, ch->wavStem, ch->wavPart);
+    rename(cur, fin);
+    ch->wavPart++;
+    snprintf(cur, sizeof(cur), "%s/%s_p%03d.wav.part", ch->wavDir, ch->wavStem, ch->wavPart);
+    FILE *nf = fopen(cur, "wb");
+    if (nf) { CRWavHeader(nf, ch->wavRate, 1); ch->wav = nf; }
+    ch->wavFrames = 0;
+    ch->wavNonZero = 0;
+    CRAppLog(@"[滚动] 已封存第%d段 → 新段开始（队列/会话不重启）", ch->wavPart - 1);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"CallRecorderSegmentRolled" object:nil];
+    });
+}
+
 static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef buffer,
                              const AudioTimeStamp *ts, UInt32 numPackets,
                              const AudioStreamPacketDescription *packetDesc) {
@@ -424,6 +454,7 @@ static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef bu
             fwrite(ch->wavScratch, sizeof(SInt16), outN, ch->wav);
             ch->wavFrames += outN;
         }
+        CRWavRollIfNeeded(ch);   // v9.5：满 60 秒就滚动文件，队列与会话保持不动
     }
     ch->totalBytes += buffer->mAudioDataByteSize;
     ch->callbacks++;
@@ -556,12 +587,20 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
 
 // v9.2 保底：给通道挂一份「回调直写 PCM WAV」输出。
 // down=1/2/4 → 44100/22050/11025 Hz（全部整数倍，无重采样插值误差）。
-- (BOOL)attachWavOutput:(NSURL *)url toChannel:(CaptureChannel *)ch down:(UInt32)down {
+- (BOOL)attachWavOutput:(NSURL *)url toChannel:(CaptureChannel *)ch down:(UInt32)down rollFrames:(UInt64)rollFrames {
     if (!url || !ch || down < 1) return NO;
-    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
-    FILE *f = fopen(url.path.fileSystemRepresentation, "wb");
-    if (!f) { CRAppLog(@"[WAV] 打开失败 %@", url.lastPathComponent); return NO; }
     UInt32 rate = (UInt32)(kTapSampleRate / down);
+    BOOL rolling = (rollFrames > 0);
+    NSString *stem = [url.lastPathComponent stringByDeletingPathExtension];
+    NSString *dirPath = [url URLByDeletingLastPathComponent].path;
+    // v9.5 常驻滚动：正在写入的文件用 .part 后缀，列表不显示；
+    // 滚动/停止时回填头并 rename 成 .wav，保证列表里每个文件都能直接播放。
+    NSString *actual = rolling
+        ? [NSString stringWithFormat:@"%@/%@_p001.wav.part", dirPath, stem]
+        : url.path;
+    [[NSFileManager defaultManager] removeItemAtPath:actual error:nil];
+    FILE *f = fopen(actual.fileSystemRepresentation, "wb");
+    if (!f) { CRAppLog(@"[WAV] 打开失败 %@", actual.lastPathComponent); return NO; }
     CRWavHeader(f, rate, 1);
     ch->wav = f;
     ch->wavDown = down;
@@ -572,9 +611,20 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
         fclose(f); ch->wav = NULL;
         CRAppLog(@"[WAV] 缓冲分配失败"); return NO;
     }
-    CRAppLog(@"[WAV] 已挂接 %.0f→%uHz/%u ÷%u → %@",
+    ch->wavFrames = 0; ch->wavNonZero = 0; ch->wavAcc = 0; ch->wavAccN = 0;
+    if (rolling) {
+        snprintf(ch->wavDir, sizeof(ch->wavDir), "%s", dirPath.fileSystemRepresentation);
+        snprintf(ch->wavStem, sizeof(ch->wavStem), "%s", stem.UTF8String);
+        ch->wavPart = 1;
+        ch->wavRollFrames = rollFrames;
+        ch->wavRolling = YES;
+    } else {
+        ch->wavRolling = NO; ch->wavRollFrames = 0; ch->wavPart = 0;
+    }
+    CRAppLog(@"[WAV] 已挂接 %.0f→%uHz/%u ÷%u → %@%@",
              kTapSampleRate, (unsigned)rate, (unsigned)ch->format.mChannelsPerFrame,
-             (unsigned)down, url.lastPathComponent);
+             (unsigned)down, actual.lastPathComponent,
+             rolling ? [NSString stringWithFormat:@" (每%llu帧滚动)", rollFrames] : @"");
     return YES;
 }
 
@@ -613,7 +663,7 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     ch->audioFile = 0;
     ch->currentPacket = 0;
     // WAV 在 Start 之前挂好，避免丢开头几个 buffer
-    if (![self attachWavOutput:wavURL toChannel:ch down:down]) {
+    if (![self attachWavOutput:wavURL toChannel:ch down:down rollFrames:0]) {
         if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:-5
                              userInfo:@{NSLocalizedDescriptionKey:@"无法创建 WAV 文件"}];
         return nil;
@@ -662,8 +712,9 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     }
     ch->audioFile = 0;
     ch->currentPacket = 0;
-    // WAV 在 Start 之前挂好，避免丢开头几个 buffer
-    if (![self attachWavOutput:wavURL toChannel:ch down:down]) {
+    // WAV 在 Start 之前挂好；★v9.5 常驻滚动：满 60 秒自动换文件，队列/会话全程不重启
+    UInt64 rollFrames = (UInt64)(60.0 * kTapSampleRate / down);
+    if (![self attachWavOutput:wavURL toChannel:ch down:down rollFrames:rollFrames]) {
         if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:-5
                              userInfo:@{NSLocalizedDescriptionKey:@"无法创建 WAV 文件"}];
         return nil;
@@ -677,7 +728,29 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     return ch;
 }
 
-// v9：官方免费版配方 —— 按微信/QQ 真实进程 PID 做 app-tap
+// v9.5 ★常驻录音入口：整个生命周期只启动一次，队列与 AVAudioSession 全程不重启。
+// 每 60 秒的文件切换发生在采集回调内部（只换 FILE*），不再 stop/start 引擎。
+// 不建 app-tap 增强路 —— 本机该路多版验证恒不推流，重建它只会增加卡死风险。
+- (BOOL)startContinuousWithFileURL:(NSURL *)fileURL error:(NSError **)error {
+    if (_recording) return YES;
+    if (_monitoring) [self stopMonitoring];
+    _autoMode = YES;
+    _appTapActive = NO;
+    _outURL = fileURL;
+    _micURL = nil; _spkURL = nil; _appURL = nil; _sysURL = nil;
+    _appWavURL = nil; _sysWavURL = nil;
+    UInt32 down = (_quality == TRQualityHigh) ? 1 : ((_quality == TRQualityNormal) ? 2 : 4);
+    _mic = [self startAutoMicWithWavURL:fileURL down:down error:error];
+    if (!_mic) { [self fail:@"常驻麦克风启动失败" error:error]; return NO; }
+    _recording = YES;
+    CRAppLog(@"[常驻] v9.5 启动OK | 单队列+单会话全程不重启, 每60秒滚动出一个WAV, 基础名=%@",
+             fileURL.lastPathComponent);
+    return YES;
+}
+
+- (NSInteger)callbackCount { return _mic ? _mic->callbacks : 0; }
+
+// v9：官方免费版配方 —— 按微信/QQ 真实进程 PID 做 app-tap（v9.5 起不再调用，保留兼容）
 - (BOOL)startAutoWithAppPIDs:(NSArray<NSNumber *> *)appPIDs
                      fileURL:(NSURL *)fileURL
                        error:(NSError **)error {
@@ -712,20 +785,20 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
                                  labelPid:appPIDs.firstObject.intValue error:nil];
         if (_app) {
             _appTapActive = YES;
-            [self attachWavOutput:_appWavURL toChannel:_app down:down];
+            [self attachWavOutput:_appWavURL toChannel:_app down:down rollFrames:0];
             CRLog(@"★app-tap 真实PID 启动成功: %@", appPIDs);
         }
     }
     if (!_app) {
         CRLog(@"app-tap 不可用 → 回退 -2 系统混音");
         _app = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker channels:2 fileURL:nil error:nil];
-        if (_app) [self attachWavOutput:_appWavURL toChannel:_app down:down];
+        if (_app) [self attachWavOutput:_appWavURL toChannel:_app down:down rollFrames:0];
     }
 
     // 诊断/兜底：-2 系统混音。仅当 app-tap 成功时再开（避免同 PID 双队列）
     if (_appTapActive) {
         _sys = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker channels:2 fileURL:nil error:nil];
-        if (_sys) [self attachWavOutput:_sysWavURL toChannel:_sys down:down];
+        if (_sys) [self attachWavOutput:_sysWavURL toChannel:_sys down:down rollFrames:0];
     } else {
         _sys = nil;
     }
@@ -767,62 +840,18 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     _recording = NO;
 
     NSFileManager *fm = [NSFileManager defaultManager];
-    (void)MixCAFs; (void)SampleRateForQuality;   // 旧链路保留但不再调用，避免未使用告警
+    (void)fm; (void)MixCAFs; (void)SampleRateForQuality;   // 旧链路保留但不再调用，避免未使用告警
 
-    // ============ v9.4 自动模式：标准麦克风 WAV 主路 + tap 增强路 ============
+    // ============ v9.5 自动常驻模式：只做收尾，不做任何混音/择优 ============
     if (_autoMode) {
-        // 下一段会重新 setActive:YES；这里先释放，避免长期占用影响微信/QQ 音频路由
+        // 只有「用户关闭自动开关 / App 退出」才会走到这里，整段运行期间会话一直 active
         [[AVAudioSession sharedInstance] setActive:NO error:nil];
-        UInt64 micFrames   = _mic ? _mic->wavFrames   : 0;
-        UInt64 micNonZero  = _mic ? _mic->wavNonZero  : 0;
-        UInt64 appNonZero  = _app ? _app->wavNonZero  : 0;
-        UInt64 sysNonZero  = _sys ? _sys->wavNonZero  : 0;
-        UInt64 micBytes    = CRFileSize(_outURL);
-        UInt32 rate        = _mic ? _mic->wavRate : 11025;
-        CRAppLog(@"[停止] WAV 主文件: 帧=%llu 非零样本=%llu 字节=%llu %uHz",
-                 micFrames, micNonZero, micBytes, (unsigned)rate);
-        CRAppLog(@"[停止] WAV 临时: app非零=%llu(%lluB) sys非零=%llu(%lluB) | 峰值 app=%.4f sys=%.4f",
-                 appNonZero, CRFileSize(_appWavURL), sysNonZero, CRFileSize(_sysWavURL),
-                 _app ? _app->peakEver : 0, _sys ? _sys->peakEver : 0);
-
-        // 对方路择优：真机已证明 -2 系统混音才是主路，按累计峰值选
-        float appPeak = _app ? _app->peakEver : 0;
-        float sysPeak = _sys ? _sys->peakEver : 0;
-        NSURL *other = nil;
-        if (_appTapActive && _sys && sysPeak >= appPeak && CRFileSize(_sysWavURL) > 44)
-            other = _sysWavURL;
-        else if (CRFileSize(_appWavURL) > 44)
-            other = _appWavURL;
-        else if (CRFileSize(_sysWavURL) > 44)
-            other = _sysWavURL;
-
-        NSString *base = [[_outURL lastPathComponent] stringByDeletingPathExtension];
-        NSURL *dir = [_outURL URLByDeletingLastPathComponent];
-        NSURL *stereoURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_双方.wav"]];
-        if (other && micBytes > 44) {
-            UInt64 frames = 0, nz = 0;
-            BOOL ok = CRMixWavToStereo(_outURL, other, stereoURL, rate, &frames, &nz);
-            CRAppLog(@"[停止] 立体声合成=%@ 帧=%llu 非零=%llu → %@",
-                     ok ? @"成功" : @"失败", frames, nz, stereoURL.lastPathComponent);
-            if (!ok || nz == 0) [fm removeItemAtURL:stereoURL error:nil];
-        }
-        CRAppLog(@"[停止] ★保底 WAV 原样保留: %@ (%lluB)，立体声另存同名 _双方.wav",
-                 _outURL.lastPathComponent, micBytes);
-
-        [fm removeItemAtURL:_appWavURL error:nil];
-        [fm removeItemAtURL:_sysWavURL error:nil];
-
-        if (micBytes > 44 && micNonZero > 0) {
-            CRLog(@"录音完成(WAV)：%@ (%lluB 非零=%llu)", _outURL.lastPathComponent, micBytes, micNonZero);
-            if ([_delegate respondsToSelector:@selector(recorderDidFinishWithURL:micLevel:speakerLevel:)])
-                [_delegate recorderDidFinishWithURL:_outURL
-                                          micLevel:_mic ? _mic->peakEver : 0
-                                      speakerLevel:_app ? _app->peakEver : 0];
-        } else {
-            CRAppLog(@"[停止] ★WAV 内无声音样本 —— 采集回调未写入数据");
-            if ([_delegate respondsToSelector:@selector(recorderDidFailWithMessage:)])
-                [_delegate recorderDidFailWithMessage:@"WAV 无声音数据"];
-        }
+        CRAppLog(@"[停止] 常驻录音结束 | 回调=%d 累计字节=%llu 峰值Ever=%.4f | 已封存%d段WAV",
+                 _mic ? _mic->callbacks : 0, _mic ? _mic->totalBytes : 0,
+                 _mic ? _mic->peakEver : 0, _mic ? (_mic->wavPart - 1) : 0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"CallRecorderSegmentRolled" object:nil];
+        });
         [self cleanup];
         return;
     }
@@ -855,7 +884,16 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     if (ch->extFile) { ExtAudioFileDispose(ch->extFile); ch->extFile = NULL; }
     if (ch->queue) { AudioQueueDispose(ch->queue, true); ch->queue = NULL; }
     // v9.2：所有回调都结束后，回填 WAV 头长度并关闭
-    if (ch->wav) { CRWavFinalize(ch->wav, ch->wavFrames, 1); fclose(ch->wav); ch->wav = NULL; }
+    // v9.5：滚动模式下把正在写的 .part 封存成可直接播放的 .wav
+    if (ch->wav) {
+        CRWavFinalize(ch->wav, ch->wavFrames, 1); fclose(ch->wav); ch->wav = NULL;
+        if (ch->wavRolling) {
+            char cur[768], fin[768];
+            snprintf(cur, sizeof(cur), "%s/%s_p%03d.wav.part", ch->wavDir, ch->wavStem, ch->wavPart);
+            snprintf(fin, sizeof(fin), "%s/%s_p%03d.wav", ch->wavDir, ch->wavStem, ch->wavPart);
+            rename(cur, fin);
+        }
+    }
     if (ch->wavScratch) { free(ch->wavScratch); ch->wavScratch = NULL; }
     ch->tap = nil;
 }
