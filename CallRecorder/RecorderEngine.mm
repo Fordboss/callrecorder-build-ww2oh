@@ -9,9 +9,11 @@
 #import "AudioQueue+Private.h"
 
 #pragma mark - 说明
-// v3.0：完全照搬官方 TrollRecorder 的 recorder.mm（真正用于通话录音的工具）。
-// 之前 v1/v2 抄错了 call-recorder.mm —— 那是实验性的"系统音频旁路(qtob)"分支，
-// 且我误删了 AVAudioSession 激活（recorder.mm 恰恰必须激活）。v3 全部改回官方配方。
+// v4.0：分通道使用官方两套配方（真实根因修复）。
+//   mic       → recorder.mm 配方：flag=0 + 激活 AVAudioSession + 不建 tap
+//   speaker/sys → call-recorder.mm 配方：flag=0x800 + qtob 接 tap + 不激活 session
+// v3 的 bug：speaker 通道创建了 tap 却漏了 AudioQueueSetProperty(qtob)，等于录一个没接源的输入 → 静音。
+// v1/v2 的 bug：抄错工具 + 误删 session 激活 + AAC 异步收尾写坏文件。
 
 static const int kNumberOfBuffers   = 3;
 static const int kMaximumBufferSize = 0x50000;
@@ -152,29 +154,38 @@ static void CalculateBufferSize(AudioQueueRef queue, AudioStreamBasicDescription
 
 - (BOOL)startWithChannel:(TRChannel)channel fileURL:(NSURL *)fileURL error:(NSError **)error {
     if (_recording) return YES;
-    CRLog(@"===== 开始录音 v3 ===== iOS=%@", [UIDevice currentDevice].systemVersion);
+    CRLog(@"===== 开始录音 v4 ===== iOS=%@", [UIDevice currentDevice].systemVersion);
 
-    // 官方 recorder.mm：只支持 mic / speaker。sys(PID=-1) 是收费的系统音频，不在此实现。
+    // ★ v4 核心修复：官方其实是两个独立工具，两套配方，不能混用。
+    //   recorder.mm       = 普通麦克风录音：flag=0  + 激活 session + 不创建 tap
+    //   call-recorder.mm  = tap 录音(支持speaker)：flag=0x800 + qtob 把 tap 接到队列 + 不激活 session
+    //   v3 的 bug：创建了 tap 却没接 qtob，speaker 通道等于在录一个没接源的输入 → 必然静音。
+    BOOL isMic = (channel == TRChannelMicrophone);
     switch (channel) {
         case TRChannelMicrophone:  _tapPID = kATAudioTapDescriptionPIDMicrophone;  break;
         case TRChannelSpeaker:     _tapPID = kATAudioTapDescriptionPIDSpeaker;     break;
-        case TRChannelSystemAudio:
-        default:                   _tapPID = kATAudioTapDescriptionPIDMicrophone;  break;  // 强制回退麦克风
+        case TRChannelSystemAudio: _tapPID = kATAudioTapDescriptionPIDSystemAudio; break;
+        default:                   _tapPID = kATAudioTapDescriptionPIDMicrophone;  break;
     }
-    UInt32 channels = (_tapPID == kATAudioTapDescriptionPIDMicrophone) ? 1 : 2;
-    CRLog(@"通道 PID=%d 采集声道=%u 采样率=%.0f", _tapPID, (unsigned)channels, kTapSampleRate);
+    UInt32 channels = isMic ? 1 : 2;
+    CRLog(@"通道 PID=%d 采集声道=%u 采样率=%.0f 模式=%@", _tapPID, (unsigned)channels,
+          kTapSampleRate, isMic ? @"普通麦克风(recorder.mm)" : @"tap旁路(call-recorder.mm)");
 
-    // ★ 官方 recorder.mm 的 AVAudioSession 配方（之前误删，这是录到声音的必要条件）
-    NSError *sessErr = nil;
-    BOOL ok = [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayAndRecord
-                                                     mode:AVAudioSessionModeDefault
-                                                  options:AVAudioSessionCategoryOptionMixWithOthers
-                                                    error:&sessErr];
-    CRLog(@"setCategory=%d err=%@", ok, sessErr.localizedDescription);
-    ok = [[AVAudioSession sharedInstance] setActive:YES error:&sessErr];
-    CRLog(@"setActive=%d err=%@", ok, sessErr.localizedDescription);
+    // ★ mic 走 recorder.mm 配方：激活 session（已验证能录到）；tap 通道绝不激活，避免抢占音频路由
+    if (isMic) {
+        NSError *sessErr = nil;
+        BOOL ok = [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayAndRecord
+                                                         mode:AVAudioSessionModeDefault
+                                                      options:AVAudioSessionCategoryOptionMixWithOthers
+                                                        error:&sessErr];
+        CRLog(@"setCategory=%d err=%@", ok, sessErr.localizedDescription);
+        ok = [[AVAudioSession sharedInstance] setActive:YES error:&sessErr];
+        CRLog(@"setActive=%d err=%@", ok, sessErr.localizedDescription);
+    } else {
+        CRLog(@"tap 通道：不激活 AVAudioSession（靠 CanRecordWithoutSessionActivation 权限）");
+    }
 
-    // 采集格式 Float32 PCM —— 与官方 recorder.mm 第 121-131 行一致
+    // 采集格式 Float32 PCM —— 官方两个工具都是 44100 / Float32
     AVAudioFormat *audioFormat = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
                                                                   sampleRate:kTapSampleRate
                                                                     channels:channels
@@ -182,22 +193,34 @@ static void CalculateBufferSize(AudioQueueRef queue, AudioStreamBasicDescription
     if (!audioFormat) return [self fail:-1 error:error where:@"AVAudioFormat"];
     _dataFormat = *([audioFormat streamDescription]);
 
-    ATAudioTapDescription *tapDesc = nil;
-    if ([ATAudioTapDescription instancesRespondToSelector:@selector(initTapInternalWithFormat:PIDs:)]) {
-        tapDesc = [[ATAudioTapDescription alloc] initTapInternalWithFormat:audioFormat PIDs:@[@(_tapPID)]];
-        CRLog(@"tap: initTapInternalWithFormat (iOS16+)");
-    } else {
-        tapDesc = [[ATAudioTapDescription alloc] initProcessTapInternalWithFormat:audioFormat PID:_tapPID];
-        CRLog(@"tap: initProcessTapInternal");
+    // ★ 只有 tap 通道才创建 ATAudioTap，并必须接上 qtob（这是 v3 漏掉的关键一行）
+    if (!isMic) {
+        ATAudioTapDescription *tapDesc = nil;
+        if ([ATAudioTapDescription instancesRespondToSelector:@selector(initTapInternalWithFormat:PIDs:)]) {
+            tapDesc = [[ATAudioTapDescription alloc] initTapInternalWithFormat:audioFormat PIDs:@[@(_tapPID)]];
+            CRLog(@"tap: initTapInternalWithFormat (iOS16+)");
+        } else {
+            tapDesc = [[ATAudioTapDescription alloc] initProcessTapInternalWithFormat:audioFormat PID:_tapPID];
+            CRLog(@"tap: initProcessTapInternal");
+        }
+        _audioTap = [[ATAudioTap alloc] initWithTapDescription:tapDesc];
+        if (!_audioTap) return [self fail:-2 error:error where:@"ATAudioTap"];
     }
-    _audioTap = [[ATAudioTap alloc] initWithTapDescription:tapDesc];
-    if (!_audioTap) return [self fail:-2 error:error where:@"ATAudioTap"];
 
-    // ★ 官方 recorder.mm：flag = 0（不是实验分支的 0x800），且没有 TapOutputBypass
+    // ★ flag：mic=0（recorder.mm）；speaker/sys=0x800（call-recorder.mm）
+    UInt32 flag = isMic ? 0 : 0x800;
     OSStatus status = AudioQueueNewInput(&_dataFormat, RecorderCallback, (__bridge void *)self,
-                                         NULL, NULL, 0, &_queue);
-    CRLog(@"AudioQueueNewInput(flag=0)=%d", (int)status);
+                                         NULL, NULL, flag, &_queue);
+    CRLog(@"AudioQueueNewInput(flag=0x%x)=%d", (unsigned)flag, (int)status);
     if (status != noErr) return [self fail:status error:error where:@"AudioQueueNewInput"];
+
+    // ★★★ 决定性的一行：把 tap 接到音频队列。没有它 speaker 永远静音。
+    if (!isMic) {
+        status = AudioQueueSetProperty(_queue, kAudioQueueProperty_TapOutputBypass,
+                                       (__bridge void *)_audioTap, 8);
+        CRLog(@"TapOutputBypass(qtob)=%d", (int)status);
+        if (status != noErr) return [self fail:status error:error where:@"TapOutputBypass"];
+    }
 
     CalculateBufferSize(_queue, _dataFormat, &_bufferSize);
     for (int i = 0; i < kNumberOfBuffers; i++) {
