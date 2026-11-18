@@ -2,6 +2,7 @@
 #import "ViewController.h"
 #import "CallMonitor.h"
 #import "ManualControl.h"
+#import "DarwinMonitor.h"
 
 @implementation AppDelegate
 
@@ -17,6 +18,8 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     [[CallMonitor shared] start];
     // 手动录音助手：注册通知 category + 代理（尽早，保证后台点击能响应）
     [[ManualControl shared] setup];
+    // 微信通话自动录音：监听 hook dylib 发出的 Darwin 通知
+    [[DarwinMonitor shared] start];
     return YES;
 }
 
