@@ -11,6 +11,17 @@
 	<true/>
 	<key>com.apple.coreaudio.CanRecordWithoutSessionActivation</key>
 	<true/>
+	<!-- 官方逆向发现：通话语音 codec 解码权限（AMR/Opus/Speex），漏了可能录到静音 -->
+	<key>com.apple.coreaudio.allow-amr-decode</key>
+	<true/>
+	<key>com.apple.coreaudio.allow-opus-codec</key>
+	<true/>
+	<key>com.apple.coreaudio.allow-speex-codec</key>
+	<true/>
+	<key>com.apple.coreaudio.register-internal-aus</key>
+	<true/>
+	<key>com.apple.backboard.client</key>
+	<true/>
 	<!-- 麦克风 TCC 白名单 -->
 	<key>com.apple.private.tcc.allow</key>
 	<array>
