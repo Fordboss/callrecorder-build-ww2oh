@@ -8,8 +8,8 @@ options:
 
 settings:
   PRODUCT_NAME: CallRecorder
-  MARKETING_VERSION: "4.0"
-  CURRENT_PROJECT_VERSION: "5"
+  MARKETING_VERSION: "5.0"
+  CURRENT_PROJECT_VERSION: "6"
   IPHONEOS_DEPLOYMENT_TARGET: "15.0"
   TARGETED_DEVICE_FAMILY: "1"
   CODE_SIGN_STYLE: Manual
@@ -35,6 +35,7 @@ targets:
       - SDK: AudioToolbox.framework
       - SDK: AVFoundation.framework
       - SDK: CoreTelephony.framework
+      - SDK: CallKit.framework
       - SDK: Speech.framework
       - SDK: Foundation.framework
       - SDK: UIKit.framework
