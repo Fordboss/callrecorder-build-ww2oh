@@ -1,17 +1,23 @@
 #import "ViewController.h"
 #import "RecorderEngine.h"
 #import <AVFoundation/AVFoundation.h>
+#import <Speech/Speech.h>
 
-@interface ViewController () <AVAudioPlayerDelegate, UITableViewDelegate, UITableViewDataSource>
+@interface ViewController () <AVAudioPlayerDelegate, UITableViewDelegate, UITableViewDataSource,
+                              SFSpeechRecognizerDelegate>
 
 @property (nonatomic, strong) UISegmentedControl *channelPicker;
 @property (nonatomic, strong) UIButton   *recordButton;
+@property (nonatomic, strong) UIButton   *qualityButton;
 @property (nonatomic, strong) UILabel    *statusLabel;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) NSMutableArray<NSURL *> *files;
 @property (nonatomic, strong) AVAudioPlayer *player;
 @property (nonatomic, assign) NSInteger playingIndex;
 @property (nonatomic, strong) NSTimer *timer;
+
+@property (nonatomic, strong) SFSpeechRecognizer *speechRecognizer;
+@property (nonatomic, strong) SFSpeechRecognitionTask *speechTask;
 
 @end
 
@@ -22,13 +28,43 @@
     self.title = @"通话录音机";
     self.view.backgroundColor = [UIColor systemBackgroundColor];
     self.playingIndex = -1;
+
+    [self setupNavBar];
     [self setupUI];
     [self loadFiles];
+
+    // 语音识别授权（静默请求，结果不影响其他功能）
+    self.speechRecognizer = [[SFSpeechRecognizer alloc] initWithLocale:[NSLocale localeWithLocaleIdentifier:@"zh-CN"]];
+    self.speechRecognizer.delegate = self;
+    [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus status) {
+        NSLog(@"语音识别授权状态: %ld", (long)status);
+    }];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self loadFiles];
+}
+
+#pragma mark - 导航栏：导出诊断日志
+
+- (void)setupNavBar {
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"诊断日志"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(shareDebugLog)];
+}
+
+- (void)shareDebugLog {
+    NSURL *url = [[RecorderEngine shared] debugLogURL];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
+        [self alert:@"还没有日志，先录一次音再导出。" title:@"诊断日志"];
+        return;
+    }
+    UIActivityViewController *av = [[UIActivityViewController alloc]
+                                    initWithActivityItems:@[url] applicationActivities:nil];
+    av.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
+    [self presentViewController:av animated:YES completion:nil];
 }
 
 #pragma mark - UI
@@ -40,9 +76,18 @@
     [self.view addSubview:picker];
     self.channelPicker = picker;
 
+    UIButton *qualityBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    qualityBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [qualityBtn setTitle:[NSString stringWithFormat:@"音质：%@", [RecorderEngine qualityDescription:[RecorderEngine shared].quality]]
+                forState:UIControlStateNormal];
+    qualityBtn.titleLabel.font = [UIFont systemFontOfSize:13];
+    [qualityBtn addTarget:self action:@selector(chooseQuality) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:qualityBtn];
+    self.qualityButton = qualityBtn;
+
     UILabel *status = [[UILabel alloc] init];
     status.translatesAutoresizingMaskIntoConstraints = NO;
-    status.text = @"准备就绪 · 16 kHz AAC 单声道（约 0.24 MB/分钟）";
+    status.text = @"准备就绪 · 点上方按钮切换音质";
     status.textAlignment = NSTextAlignmentCenter;
     status.font = [UIFont systemFontOfSize:12];
     status.textColor = [UIColor secondaryLabelColor];
@@ -60,6 +105,14 @@
     [self.view addSubview:recordBtn];
     self.recordButton = recordBtn;
 
+    UILabel *tips = [[UILabel alloc] init];
+    tips.translatesAutoresizingMaskIntoConstraints = NO;
+    tips.text = @"长按需录音文件：转文字 / 分享 / 删除";
+    tips.textAlignment = NSTextAlignmentCenter;
+    tips.font = [UIFont systemFontOfSize:11];
+    tips.textColor = [UIColor tertiaryLabelColor];
+    [self.view addSubview:tips];
+
     UITableView *tv = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
     tv.translatesAutoresizingMaskIntoConstraints = NO;
     tv.delegate = self;
@@ -74,7 +127,10 @@
         [picker.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
         [picker.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
 
-        [status.topAnchor constraintEqualToAnchor:picker.bottomAnchor constant:12],
+        [qualityBtn.topAnchor constraintEqualToAnchor:picker.bottomAnchor constant:10],
+        [qualityBtn.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+
+        [status.topAnchor constraintEqualToAnchor:qualityBtn.bottomAnchor constant:8],
         [status.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
         [status.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
 
@@ -83,11 +139,37 @@
         [recordBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-24],
         [recordBtn.heightAnchor constraintEqualToConstant:56],
 
-        [tv.topAnchor constraintEqualToAnchor:recordBtn.bottomAnchor constant:16],
+        [tips.topAnchor constraintEqualToAnchor:recordBtn.bottomAnchor constant:8],
+        [tips.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [tips.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+
+        [tv.topAnchor constraintEqualToAnchor:tips.bottomAnchor constant:8],
         [tv.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [tv.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [tv.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
     ]];
+}
+
+#pragma mark - 音质选择
+
+- (void)chooseQuality {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"录音音质 / 体积"
+                                                                  message:@"切换后下次录音生效。采样率越低，文件越小。"
+                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+    for (int i = 0; i <= 2; i++) {
+        TRQuality q = (TRQuality)i;
+        NSString *mark = ([RecorderEngine shared].quality == q) ? @"✓ " : @"";
+        [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@%@", mark, [RecorderEngine qualityDescription:q]]
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *a) {
+            [RecorderEngine shared].quality = q;
+            [self.qualityButton setTitle:[NSString stringWithFormat:@"音质：%@", [RecorderEngine qualityDescription:q]]
+                                forState:UIControlStateNormal];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = self.qualityButton;
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 #pragma mark - 录音
@@ -100,8 +182,9 @@
         self.timer = nil;
         [self.recordButton setTitle:@"●  开始录音" forState:UIControlStateNormal];
         self.recordButton.backgroundColor = [UIColor systemRedColor];
-        self.statusLabel.text = @"已保存 · 16 kHz AAC 单声道";
+        self.statusLabel.text = @"已保存 · 点列表可播放";
         self.channelPicker.enabled = YES;
+        self.qualityButton.enabled = YES;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ [self loadFiles]; });
     } else {
@@ -118,6 +201,7 @@
             return;
         }
         self.channelPicker.enabled = NO;
+        self.qualityButton.enabled = NO;
         [self.recordButton setTitle:@"■  停止录音" forState:UIControlStateNormal];
         self.recordButton.backgroundColor = [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:1.0];
         self.timer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self
@@ -126,8 +210,7 @@
 }
 
 - (void)tick {
-    NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceReferenceDate];
-    self.statusLabel.text = @"录音中 · 16 kHz AAC 单声道（点击停止保存）";
+    self.statusLabel.text = @"录音中 · 点击停止保存";
 }
 
 #pragma mark - 文件
@@ -195,7 +278,7 @@
     }
     NSError *error = nil;
     AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithContentsOfURL:self.files[indexPath.row] error:&error];
-    if (!p) { [self alert:error.localizedDescription title:@"播放失败"]; return; }
+    if (!p) { [self alert:error.localizedDescription title:@"播放失败（文件可能为空）"]; return; }
     p.delegate = self;
     [p play];
     self.player = p;
@@ -209,9 +292,13 @@
 commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndexPath *)indexPath {
     if (style != UITableViewCellEditingStyleDelete || indexPath.row >= self.files.count) return;
     NSURL *url = self.files[indexPath.row];
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"分享 / 删除录音"
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"录音操作"
                                                                   message:url.lastPathComponent
                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"转文字（中文）" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) { [self transcribeURL:url]; }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"播放" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) { [self playURL:url]; }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"分享导出" style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
         UIActivityViewController *av = [[UIActivityViewController alloc]
@@ -225,8 +312,63 @@ commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndex
         [self loadFiles];
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    sheet.popoverPresentationController.sourceCell = [tableView cellForRowAtIndexPath:indexPath];
+    sheet.popoverPresentationController.sourceView = [tableView cellForRowAtIndexPath:indexPath];
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)playURL:(NSURL *)url {
+    NSError *error = nil;
+    AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithContentsOfURL:url error:&error];
+    if (!p) { [self alert:error.localizedDescription title:@"播放失败"]; return; }
+    p.delegate = self;
+    [p play];
+    self.player = p;
+}
+
+#pragma mark - 语音转文字
+
+- (void)transcribeURL:(NSURL *)url {
+    if (!self.speechRecognizer || !self.speechRecognizer.available) {
+        [self alert:@"当前设备/语言暂不支持语音识别，请确认已安装中文识别模型。" title:@"无法转文字"];
+        return;
+    }
+    if ([SFSpeechRecognizer authorizationStatus] != SFSpeechRecognizerAuthorizationStatusAuthorized) {
+        [self alert:@"请在 设置-隐私-语音识别 中允许本 App 使用语音识别。" title:@"需要授权"];
+        return;
+    }
+    if (self.speechTask) { [self.speechTask cancel]; self.speechTask = nil; }
+
+    self.statusLabel.text = @"语音识别中…（长音频可能需十几秒）";
+    SFSpeechURLRecognitionRequest *request = [[SFSpeechURLRecognitionRequest alloc] initWithURL:url];
+    // 优先设备端识别，不上传音频（iOS 15+ 中文支持设备端）
+    if (@available(iOS 14.0, *)) request.requiresOnDeviceRecognition = YES;
+
+    __weak typeof(self) weakSelf = self;
+    self.speechTask = [self.speechRecognizer recognitionTaskWithRequest:request
+                                                         resultHandler:^(SFSpeechRecognitionResult *result, NSError *error) {
+        if (error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf alert:error.localizedDescription ?: @"识别失败" title:@"转文字失败"];
+            });
+            return;
+        }
+        if (result.isFinal) {
+            NSString *text = result.bestTranscription.formattedString;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (text.length == 0) {
+                    [weakSelf alert:@"没有识别到语音内容（录音可能为空或声音太小）。" title:@"转文字结果"];
+                    return;
+                }
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"转文字结果"
+                                                                           message:text
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+                [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault
+                                                     handler:^(UIAlertAction *a) { [UIPasteboard generalPasteboard].string = text; }]];
+                [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [weakSelf presentViewController:ac animated:YES completion:nil];
+            });
+        }
+    }];
 }
 
 - (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {

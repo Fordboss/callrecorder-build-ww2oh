@@ -26,16 +26,27 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$PWD/build/CallRecorder.xcarchive" \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO \
+            CLANG_ENABLE_MODULES=NO \
+            OTHER_LDFLAGS='-framework AudioToolbox -framework AVFoundation -framework CoreTelephony -framework CoreGraphics -framework Speech -framework Foundation -framework UIKit'
 
       - name: 打包 + ad-hoc 签名（带私有权限 entitlements）
         run: |
           mkdir -p build/Payload
-          cp -R "$PWD/build/CallRecorder.xcarchive/Products/Applications/CallRecorder.app" build/Payload/
+          # 动态定位归档里的 .app（PRODUCT_NAME 是中文，名字不固定）
+          APP=$(find "$PWD/build/CallRecorder.xcarchive/Products/Applications" -maxdepth 1 -name "*.app" -print -quit)
+          echo "找到 App: $APP"
+          cp -R "$APP" build/Payload/
+          APPNAME=$(basename "$APP")
           # 用 ad-hoc 签名并嵌入 entitlements —— 巨魔安装时靠 CoreTrust 漏洞坐实这些权限
-          codesign --force --sign - --timestamp=none \
+          codesign --force --deep --sign - --timestamp=none \
             --entitlements CallRecorder/CallRecorder.entitlements \
-            build/Payload/CallRecorder.app
+            "build/Payload/$APPNAME"
+          # 验证签名与权限是否真正嵌入
+          echo "=== 签名验证 ==="
+          codesign -dv "build/Payload/$APPNAME" 2>&1 | head -20 || true
+          echo "=== 嵌入的 entitlements ==="
+          codesign -d --entitlements :- "build/Payload/$APPNAME" 2>/dev/null || echo "(无法读取 entitlements)"
           cd build
           zip -qry CallRecorder.ipa Payload
           echo "IPA 大小："
