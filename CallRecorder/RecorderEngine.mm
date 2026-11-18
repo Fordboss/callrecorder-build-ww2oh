@@ -626,6 +626,57 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     return ch;
 }
 
+// v9.4 ★自动模式主路：与「单点开始录音」完全同一套标准麦克风队列
+// （真机已验证 100% 出声），差别只在会话选项：MixWithOthers + 不强制外放，
+// 避免打断/改变微信、QQ 通话本身的音频路由。
+// 私有 tap 在本机多版验证均为「回调有触发但 buffer 全 0 字节」（不推流），
+// 不再把它当主路；app/sys 两路降级为「对方声道增强」，有数据才合成 _双方.wav。
+- (CaptureChannel *)startAutoMicWithWavURL:(NSURL *)wavURL down:(UInt32)down error:(NSError **)error {
+    CaptureChannel *ch = [CaptureChannel new];
+    ch->pid = -3;
+    AVAudioFormat *af = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
+                                                         sampleRate:kTapSampleRate
+                                                           channels:1 interleaved:YES];
+    ch->format = *([af streamDescription]);
+
+    AVAudioSession *sess = [AVAudioSession sharedInstance];
+    [sess setCategory:AVAudioSessionCategoryPlayAndRecord
+                 mode:AVAudioSessionModeMeasurement
+              options:AVAudioSessionCategoryOptionMixWithOthers error:nil];
+    [sess setActive:YES error:nil];
+
+    // flag 0 = 普通输入队列；不建 tap、不设 qtob —— 与已验证成功的单点路径一致
+    OSStatus st = AudioQueueNewInput(&ch->format, RecorderCallback, (__bridge void *)ch,
+                                     NULL, NULL, 0, &ch->queue);
+    if (st != noErr) {
+        CRAppLog(@"[自动] 标准麦克风 AudioQueueNewInput 失败 st=%d", (int)st);
+        if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:(int)st
+                             userInfo:@{NSLocalizedDescriptionKey:@"无法创建麦克风录音队列"}];
+        return nil;
+    }
+    CalcBufSize(ch->queue, ch->format, &ch->bufferSize);
+    for (int i = 0; i < kNumberOfBuffers; i++) {
+        st = AudioQueueAllocateBuffer(ch->queue, ch->bufferSize, &ch->buffers[i]);
+        if (st != noErr) return nil;
+        AudioQueueEnqueueBuffer(ch->queue, ch->buffers[i], 0, NULL);
+    }
+    ch->audioFile = 0;
+    ch->currentPacket = 0;
+    // WAV 在 Start 之前挂好，避免丢开头几个 buffer
+    if (![self attachWavOutput:wavURL toChannel:ch down:down]) {
+        if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:-5
+                             userInfo:@{NSLocalizedDescriptionKey:@"无法创建 WAV 文件"}];
+        return nil;
+    }
+    ch->stopRequested = NO;
+    ch->running = YES;                 // ★Start 之前，配合 v9.3 的无条件重新入队
+    st = AudioQueueStart(ch->queue, NULL);
+    CRAppLog(@"[自动] 标准麦克风主路 Start=%d buf=%u (MixWithOthers, 不强制外放)",
+             (int)st, (unsigned)ch->bufferSize);
+    if (st != noErr) { ch->running = NO; return nil; }
+    return ch;
+}
+
 // v9：官方免费版配方 —— 按微信/QQ 真实进程 PID 做 app-tap
 - (BOOL)startAutoWithAppPIDs:(NSArray<NSNumber *> *)appPIDs
                      fileURL:(NSURL *)fileURL
@@ -648,14 +699,14 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     // 44100 → ÷4=11025 / ÷2=22050 / ÷1=44100，全部整数抽取，无插值误差
     UInt32 down = (_quality == TRQualityHigh) ? 1 : ((_quality == TRQualityNormal) ? 2 : 4);
 
-    // 自己：麦克风 -3 → 直接写保底 WAV（最终主文件就是它，全程不覆盖、不转码）
-    _mic = [self startChannelWithPID:kATAudioTapDescriptionPIDMicrophone channels:1 fileURL:nil error:error];
-    if (!_mic) { [self fail:@"麦克风通道启动失败" error:error]; return NO; }
-    BOOL wavOK = [self attachWavOutput:_outURL toChannel:_mic down:down];
-    CRAppLog(@"[WAV] 麦克风保底直写 %@", wavOK ? @"成功" : @"失败");
-    if (!wavOK) { [self fail:@"无法创建 WAV 文件" error:error]; return NO; }
+    // ★v9.4 自己：标准麦克风主路（真机「单点」已验证 100% 出声）。
+    // 不再用私有 tap 的 -3 —— 本机 tap 回调 buffer 恒为 0 字节，是自动模式零文件的根因。
+    _mic = [self startAutoMicWithWavURL:_outURL down:down error:error];
+    if (!_mic) { [self fail:@"标准麦克风主路启动失败" error:error]; return NO; }
+    CRAppLog(@"[WAV] 主路=标准麦克风队列(确定有数据) → %@", _outURL.lastPathComponent);
 
-    // 对方：真实进程 PID app-tap（临时 WAV，停止时择优）
+    // 对方：真实进程 PID app-tap（★v9.4 降级为增强路，仅用于合成 _双方.wav；
+    // 这台设备上 tap 不推流，失败也完全不影响标准麦克风主文件）
     if (appPIDs.count > 0) {
         _app = [self startChannelWithPIDs:appPIDs channels:2 fileURL:nil
                                  labelPid:appPIDs.firstObject.intValue error:nil];
@@ -680,9 +731,8 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     }
 
     _recording = YES;
-    CRLog(@"v9 通道: mic=%@ app=%@(真实PID=%@) sys=%@",
-          _mic?@"OK":@"FAIL", _app?@"OK":@"FAIL",
-          _appTapActive?@"Y":@"N", _sys?@"OK":@"N/A");
+    CRAppLog(@"[自动] v9.4 通道: 主路标准麦克风=%@ | 增强路 app-tap=%@ sys混音=%@ (增强路无数据不影响出文件)",
+             _mic?@"OK":@"FAIL", _app?@"OK":@"N/A", _sys?@"OK":@"N/A");
     return _mic != nil;
 }
 
@@ -696,7 +746,7 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     // 之前手动/自动共用 tap 通道，一旦 tap 不推数据 / 队列饿死，就必然「输出文件为空」。
     UInt32 down = (_quality == TRQualityHigh) ? 1 : ((_quality == TRQualityNormal) ? 2 : 4);
     self->_micURL = nil; self->_spkURL = nil; self->_appURL = nil; self->_sysURL = nil;
-    CRLog(@"========== 开始录音 v9.3 (标准麦克风 WAV) iOS=%@ ==========", [UIDevice currentDevice].systemVersion);
+    CRLog(@"========== 开始录音 v9.4 (标准麦克风 WAV) iOS=%@ ==========", [UIDevice currentDevice].systemVersion);
     _mic = [self startPlainMicWithWavURL:_outURL down:down error:error];
     if (!_mic) { [self fail:@"麦克风启动失败" error:error]; return NO; }
     _recording = YES;
@@ -719,8 +769,10 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     NSFileManager *fm = [NSFileManager defaultManager];
     (void)MixCAFs; (void)SampleRateForQuality;   // 旧链路保留但不再调用，避免未使用告警
 
-    // ============ v9.2 自动模式：纯 WAV 路径，绝不触碰 AAC / CAF / MixCAFs ============
+    // ============ v9.4 自动模式：标准麦克风 WAV 主路 + tap 增强路 ============
     if (_autoMode) {
+        // 下一段会重新 setActive:YES；这里先释放，避免长期占用影响微信/QQ 音频路由
+        [[AVAudioSession sharedInstance] setActive:NO error:nil];
         UInt64 micFrames   = _mic ? _mic->wavFrames   : 0;
         UInt64 micNonZero  = _mic ? _mic->wavNonZero  : 0;
         UInt64 appNonZero  = _app ? _app->wavNonZero  : 0;
