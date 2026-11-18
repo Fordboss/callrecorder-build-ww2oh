@@ -1,6 +1,8 @@
 #import "ViewController.h"
 #import "RecorderEngine.h"
 #import "CallMonitor.h"
+#import "ManualControl.h"
+#import "FloatingBall.h"
 #import <AVFoundation/AVFoundation.h>
 #import <Speech/Speech.h>
 
@@ -11,6 +13,8 @@
 @property (nonatomic, strong) UIButton   *recordButton;
 @property (nonatomic, strong) UIButton   *qualityButton;
 @property (nonatomic, strong) UISwitch  *autoSwitch;
+@property (nonatomic, strong) UIButton   *notifyBtn;      // 启用通知栏手动控制
+@property (nonatomic, strong) UISwitch  *floatSwitch;     // 悬浮球开关
 @property (nonatomic, strong) UILabel    *statusLabel;
 @property (nonatomic, strong) UILabel    *levelLabel;
 @property (nonatomic, strong) UITableView *tableView;
@@ -101,6 +105,27 @@
     [sw addTarget:self action:@selector(toggleAuto:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:sw]; self.autoSwitch = sw;
 
+    // ===== 微信/QQ 手动录音助手（通知栏 + 悬浮球）=====
+    UIButton *notifyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    notifyBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [notifyBtn setTitle:@"① 启用微信/QQ 通知栏录音按钮" forState:UIControlStateNormal];
+    notifyBtn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    notifyBtn.backgroundColor = [UIColor colorWithRed:0.13 green:0.42 blue:0.85 alpha:0.12];
+    notifyBtn.layer.cornerRadius = 8;
+    [notifyBtn addTarget:self action:@selector(enableManualAssistant) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:notifyBtn]; self.notifyBtn = notifyBtn;
+
+    UILabel *floatLbl = [[UILabel alloc] init];
+    floatLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    floatLbl.text = @"② 悬浮球（浮在微信上，可拖动）";
+    floatLbl.font = [UIFont systemFontOfSize:13];
+    [self.view addSubview:floatLbl];
+    UISwitch *floatSw = [[UISwitch alloc] init];
+    floatSw.translatesAutoresizingMaskIntoConstraints = NO;
+    floatSw.on = NO;
+    [floatSw addTarget:self action:@selector(toggleFloatBall:) forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:floatSw]; self.floatSwitch = floatSw;
+
     UILabel *status = [[UILabel alloc] init];
     status.translatesAutoresizingMaskIntoConstraints = NO;
     status.text = @"准备就绪";
@@ -152,7 +177,15 @@
         [autoLbl.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
         [sw.topAnchor constraintEqualToAnchor:qualityBtn.bottomAnchor constant:6],
         [sw.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
-        [status.topAnchor constraintEqualToAnchor:autoLbl.bottomAnchor constant:10],
+        [notifyBtn.topAnchor constraintEqualToAnchor:autoLbl.bottomAnchor constant:12],
+        [notifyBtn.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [notifyBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+        [notifyBtn.heightAnchor constraintEqualToConstant:38],
+        [floatLbl.topAnchor constraintEqualToAnchor:notifyBtn.bottomAnchor constant:12],
+        [floatLbl.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
+        [floatSw.topAnchor constraintEqualToAnchor:notifyBtn.bottomAnchor constant:8],
+        [floatSw.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
+        [status.topAnchor constraintEqualToAnchor:floatLbl.bottomAnchor constant:12],
         [status.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
         [status.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
         [level.topAnchor constraintEqualToAnchor:status.bottomAnchor constant:4],
@@ -177,6 +210,24 @@
     [self alert:sw.on ? @"已开启：电话/来电接通时自动开始双路录音，挂断自动保存。"
                       : @"已关闭自动录音。"
           title:@"来电自动录音"];
+}
+
+// 启用通知栏手动控制：授权后发一条常驻通知，微信/QQ 通话时下拉点按钮即可录音
+- (void)enableManualAssistant {
+    [[ManualControl shared] requestPermissionAndEnable];
+    [self alert:@"已向通知中心投递『手动通话录音助手』。\n\n用法：微信/QQ 来电接通后，下拉通知中心，点通知上的『开始/停止录音』按钮即可，无需切回本 App。录音完成会再推一条结果通知。\n\n注：如果通知没出现，去 设置-通知 里允许本 App 通知。"
+          title:@"微信/QQ 手动录音助手"];
+}
+
+// 悬浮球开关（TrollStore 权限下可浮在微信/QQ 之上）
+- (void)toggleFloatBall:(UISwitch *)sw {
+    if (sw.on) {
+        [[FloatingBall shared] show];
+        [self alert:@"悬浮球已显示，可拖到屏幕任意位置。\n\n微信/QQ 通话时点一下『录』开始、点『停』保存。\n\n注：悬浮球能否盖在微信之上取决于系统版本；盖不住就用通知栏按钮，那个一定可用。"
+              title:@"悬浮球"];
+    } else {
+        [[FloatingBall shared] hide];
+    }
 }
 
 - (void)chooseQuality {
@@ -250,11 +301,16 @@
 #pragma mark RecorderEngineDelegate
 
 - (void)recorderDidFinishWithURL:(NSURL *)url micLevel:(float)micLevel speakerLevel:(float)spkLevel {
+    NSString *mic = micLevel < 0.001 ? @"无" : [NSString stringWithFormat:@"%.2f", micLevel];
+    NSString *spk = spkLevel < 0.001 ? @"无" : [NSString stringWithFormat:@"%.2f", spkLevel];
+    NSString *body = [NSString stringWithFormat:@"自己:%@ 对方:%@ · %@", mic, spk, url.lastPathComponent];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ManualRecordingDoneNotification
+                                                        object:nil
+                                                      userInfo:@{ @"body": body }];
     dispatch_async(dispatch_get_main_queue(), ^{
         [self loadFiles];
-        NSString *mic = micLevel < 0.001 ? @"无" : [NSString stringWithFormat:@"%.2f", micLevel];
-        NSString *spk = spkLevel < 0.001 ? @"无" : [NSString stringWithFormat:@"%.2f", spkLevel];
         self.statusLabel.text = [NSString stringWithFormat:@"已保存 · 自己:%@ 对方:%@", mic, spk];
+        [[FloatingBall shared] tapFromBackground];
     });
 }
 - (void)recorderDidFailWithMessage:(NSString *)msg {
