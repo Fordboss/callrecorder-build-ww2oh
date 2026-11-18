@@ -6,7 +6,9 @@
 #import "DarwinMonitor.h"
 #import "AppCallMonitor.h"
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <Speech/Speech.h>
+#import <stdlib.h>
 
 @interface ViewController () <AVAudioPlayerDelegate, UITableViewDelegate, UITableViewDataSource,
                               SFSpeechRecognizerDelegate, RecorderEngineDelegate>
@@ -152,7 +154,7 @@
     // 微信通话自动录音（需先注入 WeChatCallHook.dylib 到微信）
     UILabel *wxLbl = [[UILabel alloc] init];
     wxLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    wxLbl.text = @"③ 微信/QQ自动录音（v9.1 保底直写·免注入）";
+    wxLbl.text = @"③ 微信/QQ自动录音（v9.2 WAV直写·免注入）";
     wxLbl.font = [UIFont systemFontOfSize:13];
     [self.view addSubview:wxLbl];
     UISwitch *wxSw = [[UISwitch alloc] init];
@@ -262,9 +264,9 @@
 - (void)toggleWeChatAuto:(UISwitch *)sw {
     [AppCallMonitor shared].thirdPartyAutoEnabled = sw.on;
     [self alert:sw.on
-        ? @"已开启【v9.1 自动录音】：装上即用，无需注入、无需脱壳。\n\n真机验证已确认：真正出声的是麦克风 -3 与系统混音 -2，app-tap 真实 PID 路几乎无声，因此本版把 PID 白名单收窄到微信/QQ 主进程，并仍以 -2 为对方主路。\n\n★关键修复：麦克风 PCM 在采集回调里直接编码成 m4a 保底文件，不再依赖二次读盘混音；只有混音成功且确实写出音频帧时才升级为立体声。每2分钟存一段、只留最近30段。\n\n请保持本 App 在后台（不要强杀）。打完电话点顶部『微信日志』，看 [实时] 电平和 [停止] 行的文件字节数/混音帧数。"
+        ? @"已开启【v9.2 自动录音】：装上即用，无需注入、无需脱壳。\n\n★两处关键修复：\n① 出文件改为采集回调里 Float32→Int16 直接写标准 PCM WAV，彻底不经过 AAC 编码器 / ExtAudioFile / CAF 二次读盘 / 混音；保底 WAV 永不覆盖，另存一份 _双方.wav 立体声。\n② 播放前激活 AVAudioSession(Playback)，修掉 v9 起「为 tap 不激活会话」导致静音键把文件声音吞掉的问题 —— 不用重录，现在直接点列表里旧文件也能听。\n\n每2分钟一段、只留最近20段，默认 11.025kHz 省空间。长按文件选『文件体检』，会直接告诉你文件里到底有没有声音数据。"
         : @"已关闭自动录音，已停止并保存当前段。"
-          title:@"v9.1 自动录音"];
+          title:@"v9.2 自动录音"];
 }
 
 // 悬浮球开关（TrollStore 权限下可浮在微信/QQ 之上）
@@ -397,9 +399,12 @@
     NSMutableArray *result = [NSMutableArray array];
     for (NSURL *u in items) {
         NSString *ext = u.pathExtension.lowercaseString;
-        // 只显示最终 m4a，隐藏中间 CAF
-        if ([ext isEqualToString:@"m4a"] || [ext isEqualToString:@"caf"]) {
-            if ([u.lastPathComponent containsString:@"_mic"] || [u.lastPathComponent containsString:@"_spk"]) continue;
+        // 只显示最终成品，隐藏三路临时文件
+        if ([ext isEqualToString:@"wav"] || [ext isEqualToString:@"m4a"] || [ext isEqualToString:@"caf"]) {
+            NSString *n = u.lastPathComponent;
+            if ([n containsString:@"_mic"] || [n containsString:@"_spk"] ||
+                [n containsString:@"_app"] || [n containsString:@"_sys"] ||
+                [n containsString:@"_mix"] || [n containsString:@"_direct"]) continue;
             [result addObject:u];
         }
     }
@@ -437,12 +442,26 @@
     [t deselectRowAtIndexPath:ip animated:YES];
     if (ip.row >= self.files.count) return;
     if (self.player.isPlaying && self.playingIndex == ip.row) {
-        [self.player stop]; self.player = nil; self.playingIndex = -1; [t reloadData]; return;
+        [self.player stop]; self.player = nil; self.playingIndex = -1;
+        [[AVAudioSession sharedInstance] setActive:NO error:nil];
+        [t reloadData]; return;
     }
+    // v9.2 ★关键修复：v9 起为 tap 全程不激活 AVAudioSession，AVAudioPlayer 会落到
+    // 默认 SoloAmbient category，被静音键 / 输出路由吞掉 → 「文件里有数据却听不到」。
+    // 播放前显式激活 Playback，播完 deactivate 让 tap 继续常驻。
+    AVAudioSession *sess = [AVAudioSession sharedInstance];
+    [sess setCategory:AVAudioSessionCategoryPlayback error:nil];
+    [sess setActive:YES error:nil];
     NSError *error = nil;
     AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithContentsOfURL:self.files[ip.row] error:&error];
     if (!p) { [self alert:error.localizedDescription ?: @"文件可能为空" title:@"播放失败"]; return; }
-    p.delegate = self; [p play]; self.player = p; self.playingIndex = ip.row; [t reloadData];
+    p.delegate = self;
+    [p prepareToPlay];
+    if (![p play]) {
+        [self alert:@"播放器未能启动，请用「分享导出」发到微信里试听" title:@"播放失败"];
+        return;
+    }
+    self.player = p; self.playingIndex = ip.row; [t reloadData];
 }
 - (BOOL)tableView:(UITableView *)t canEditRowAtIndexPath:(NSIndexPath *)ip { return YES; }
 - (void)tableView:(UITableView *)t commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndexPath *)ip {
@@ -450,6 +469,8 @@
     NSURL *url = self.files[ip.row];
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"录音操作" message:url.lastPathComponent
                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"文件体检（看有没有声音）" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) { [self inspectURL:url]; }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"转文字（中文）" style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) { [self transcribeURL:url]; }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"分享导出" style:UIAlertActionStyleDefault
@@ -465,6 +486,59 @@
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     sheet.popoverPresentationController.sourceView = [t cellForRowAtIndexPath:ip];
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+#pragma mark - 文件体检（v9.2：一次区分「文件静音」还是「播放静音」）
+
+- (void)inspectURL:(NSURL *)url {
+    UInt64 bytes = [[[NSFileManager defaultManager] attributesOfItemAtPath:url.path error:nil][NSFileSize] unsignedLongLongValue];
+    ExtAudioFileRef f = NULL;
+    OSStatus st = ExtAudioFileOpenURL((__bridge CFURLRef)url, &f);
+    if (st != noErr || !f) {
+        [self alert:[NSString stringWithFormat:@"文件大小 %llu B\n无法解码读取 (st=%d)\n\n若只有几十字节 → 是空文件；\n若几百 KB 却打不开 → 换「分享导出」用别的播放器试。",
+                     bytes, (int)st] title:@"文件体检"];
+        return;
+    }
+    AudioStreamBasicDescription client = {0};
+    client.mSampleRate = 44100;
+    client.mFormatID = kAudioFormatLinearPCM;
+    client.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    client.mFramesPerPacket = 1;
+    client.mChannelsPerFrame = 1;
+    client.mBitsPerChannel = 32;
+    client.mBytesPerFrame = 4;
+    client.mBytesPerPacket = 4;
+    ExtAudioFileSetProperty(f, kExtAudioFileProperty_ClientDataFormat, sizeof(client), &client);
+
+    const UInt32 kBufFrames = 8192;
+    Float32 *buf = (Float32 *)calloc(kBufFrames, sizeof(Float32));
+    float peak = 0; UInt64 readFrames = 0, nonZero = 0;
+    if (buf) {
+        AudioBufferList abl = {0};
+        abl.mNumberBuffers = 1;
+        abl.mBuffers[0].mNumberChannels = 1;
+        abl.mBuffers[0].mData = buf;
+        while (readFrames < 60ULL * 60 * 44100) {
+            abl.mBuffers[0].mDataByteSize = kBufFrames * sizeof(Float32);
+            UInt32 n = kBufFrames;
+            if (ExtAudioFileRead(f, &n, &abl) != noErr || n == 0) break;
+            for (UInt32 i = 0; i < n; i++) {
+                Float32 v = buf[i];
+                float a = v < 0 ? -v : v;
+                if (a > peak) peak = a;
+                if (a > 0.0001f) nonZero++;
+            }
+            readFrames += n;
+        }
+        free(buf);
+    }
+    ExtAudioFileDispose(f);
+    NSString *verdict = (peak > 0.001f)
+        ? @"✅ 文件里【有声音数据】。如果耳朵听不到，是播放端被静音键/输出路由吞了 —— v9.2 已在播放前激活 AVAudioSession 修好。"
+        : @"❌ 文件里几乎没有声音数据（整段静音）。这是出文件链的问题 —— v9.2 已改为 PCM WAV 回调直写，不再经过 AAC 编码。";
+    [self alert:[NSString stringWithFormat:@"%@\n\n大小：%llu B\n时长：约 %.1f 秒\n读到帧数：%llu\n非零样本：%llu\n峰值：%.4f",
+                 verdict, bytes, (double)readFrames / 44100.0, readFrames, nonZero, peak]
+          title:@"文件体检"];
 }
 
 #pragma mark - 转文字
@@ -497,7 +571,9 @@
 }
 
 - (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
-    self.playingIndex = -1; self.player = nil; [self.tableView reloadData];
+    self.playingIndex = -1; self.player = nil;
+    [[AVAudioSession sharedInstance] setActive:NO error:nil];
+    [self.tableView reloadData];
 }
 
 - (void)alert:(NSString *)msg title:(NSString *)title {

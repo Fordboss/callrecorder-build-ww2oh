@@ -22,8 +22,10 @@
 //   2. 把这些 PID 一次性传给 initTapInternalWithFormat:PIDs:（官方同款）。
 //   3. 「装上即用」：App 一启动就常驻录音，不做任何通话检测（本机已证实通知类信号全失效）。
 //   4. 麦克风路 -3、真实PID路 app-tap、-2 系统混音路 三路并行，按累计峰值择优。
-//   5. ★v9.1 保底：麦克风路在采集回调里直接写一份 AAC m4a（见 RecorderEngine），
-//      不再把文件成败押在「CAF→二次打开→格式转换→混音」链路上；混音成功才升级为立体声。
+//   5. ★v9.2 出文件：麦克风路在采集回调里直接写【标准 PCM WAV】（见 RecorderEngine），
+//      完全不经过 AAC 编码器 / ExtAudioFile / CAF 二次打开 / MixCAFs；
+//      保底 WAV 永不覆盖，对方路另做纯字节交叉合成 _双方.wav。
+//      两版「电平有值但文件静音」的根因就是出文件链，这版从结构上消除。
 //   6. PID 会随微信/QQ 重启变化 → 每 15 秒刷新，变化就切段重建 tap。
 // 不注入、不脱壳、不激活 AVAudioSession、不依赖任何会失效的通知 API。
 // ============================================================
@@ -31,7 +33,7 @@
 static NSString * const kThirdPartyAutoKey = @"CallRecorderThirdPartyAuto";
 static NSString * const kLogName = @"appcall_monitor.log";
 static const NSTimeInterval kSegmentSeconds = 120.0;  // 每段2分钟（更快刷新PID/更细粒度）
-static const NSInteger kKeepSegments = 30;            // 只保留最近30段(约1小时)
+static const NSInteger kKeepSegments = 20;            // v9.2 WAV 体积较大，收敛到最近20段(约40分钟)
 static const NSTimeInterval kPIDWatchSeconds = 15.0;  // PID 刷新周期
 
 #pragma mark - 进程枚举（真实 PID）
@@ -145,11 +147,11 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 #pragma mark - 启动
 
 - (void)start {
-    [self log:@"===== 持续录音 v9.1 (保底直写 + app-tap) 启动 ====="];
-    [self log:@"配方: initTapInternalWithFormat:PIDs: ← 仅微信/QQ主进程PID, 不注入/不脱壳"];
-    [self log:@"三路: 自己(-3) + 对方(真实PID) + 系统混音(-2), 停止时自动择优"];
-    [self log:@"★保底: 麦克风PCM在回调里直接编码成m4a, 混音仅为立体声增强"];
-    [self log:@"不激活AVAudioSession, 装上即用, 每%.0f秒一段, 每%.0f秒刷新PID", kSegmentSeconds, kPIDWatchSeconds];
+    [self log:@"===== 持续录音 v9.2 (PCM WAV 直写) 启动 ====="];
+    [self log:@"★出文件: 回调里 Float32→Int16→fwrite 写标准 WAV, 不经AAC/ExtAudioFile/CAF/混音编码"];
+    [self log:@"三路: 自己(-3) + 对方(真实PID) + 系统混音(-2), 停止时纯字节择优合成 _双方.wav"];
+    [self log:@"保底 WAV 永不覆盖; 播放前会激活 AVAudioSession(避免静音键导致听不到)"];
+    [self log:@"不注入/不脱壳, 装上即用, 每%.0f秒一段, 每%.0f秒刷新PID", kSegmentSeconds, kPIDWatchSeconds];
 
     NSArray<NSString *> *names = nil;
     NSArray<NSNumber *> *pids = FindCallAppPIDs(&names);
@@ -222,7 +224,7 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
     self.segmentPeak = 0;
 
     NSDateFormatter *fmt = [NSDateFormatter new]; fmt.dateFormat = @"yyyyMMdd_HHmmss";
-    NSString *name = [NSString stringWithFormat:@"rec_%@.m4a", [fmt stringFromDate:[NSDate date]]];
+    NSString *name = [NSString stringWithFormat:@"rec_%@.wav", [fmt stringFromDate:[NSDate date]]];
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSURL *url = [NSURL fileURLWithPath:[docs stringByAppendingPathComponent:name]];
 
@@ -260,7 +262,7 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
           self.segmentPeak > 0.01 ? @"★有声音(可能含通话)" : @"(静音/底噪)",
           eng.appTapActive ? @"Y" : @"N"];
 
-    [eng stop];   // 同步混音保存 m4a（内部自动择优）
+    [eng stop];   // 同步收尾 WAV 头 + 纯字节合成（内部自动择优）
     [self cleanupOldSegments];
 
     __weak typeof(self) wf = self;
@@ -283,7 +285,7 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
         NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
         NSMutableArray *recs = [NSMutableArray array];
         for (NSString *f in files) {
-            if ([f hasPrefix:@"rec_"] && [f hasSuffix:@".m4a"]) {
+            if ([f hasPrefix:@"rec_"] && ([f hasSuffix:@".wav"] || [f hasSuffix:@".m4a"])) {
                 NSString *full = [docs stringByAppendingPathComponent:f];
                 NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:full error:nil];
                 [recs addObject:@{@"path":full, @"date":attr[NSFileCreationDate] ?: [NSDate date]}];

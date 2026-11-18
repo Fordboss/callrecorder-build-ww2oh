@@ -3,6 +3,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <UIKit/UIKit.h>
 #import <math.h>
+#import <stdio.h>
 
 #import "ATAudioTap.h"
 #import "ATAudioTapDescription.h"
@@ -69,6 +70,66 @@ static UInt64 CRFileSize(NSURL *u) {
     return [a[NSFileSize] unsignedLongLongValue];
 }
 
+#pragma mark - v9.2 纯 PCM WAV 直写（不经过任何编码器）
+// 之前的 AAC/m4a 由 ExtAudioFile 编码，真机两版都出现「电平有值、文件静音」。
+// WAV 是唯一「回调里有 PCM，文件里就一定有声音」的格式：
+// 没有 converter、没有 packet desc、没有二次打开、没有 flush 语义。
+
+static void CRPut16(FILE *f, UInt16 v) {
+    UInt8 b[2] = { (UInt8)(v & 0xff), (UInt8)((v >> 8) & 0xff) };
+    fwrite(b, 1, 2, f);
+}
+static void CRPut32(FILE *f, UInt32 v) {
+    UInt8 b[4] = { (UInt8)(v & 0xff), (UInt8)((v >> 8) & 0xff),
+                   (UInt8)((v >> 16) & 0xff), (UInt8)((v >> 24) & 0xff) };
+    fwrite(b, 1, 4, f);
+}
+// 写 44 字节标准 RIFF/WAVE 头，长度字段先占位，结束时回填
+static void CRWavHeader(FILE *f, UInt32 rate, UInt16 channels) {
+    fwrite("RIFF", 1, 4, f); CRPut32(f, 36);
+    fwrite("WAVE", 1, 4, f); fwrite("fmt ", 1, 4, f);
+    CRPut32(f, 16); CRPut16(f, 1); CRPut16(f, channels);
+    CRPut32(f, rate); CRPut32(f, rate * channels * 2);
+    CRPut16(f, channels * 2); CRPut16(f, 16);
+    fwrite("data", 1, 4, f); CRPut32(f, 0);
+}
+static void CRWavFinalize(FILE *f, UInt64 frames, UInt16 channels) {
+    if (!f) return;
+    UInt64 dataBytes = frames * channels * 2;
+    if (fseek(f, 4, SEEK_SET) == 0)  CRPut32(f, (UInt32)(36 + dataBytes));
+    if (fseek(f, 40, SEEK_SET) == 0) CRPut32(f, (UInt32)dataBytes);
+    fflush(f);
+}
+// 两个单声道 WAV 纯字节交叉合成一个立体声 WAV（左=自己 右=对方）。
+// 全程只做 fread/fwrite，不涉及任何编解码或格式转换。
+static BOOL CRMixWavToStereo(NSURL *aURL, NSURL *bURL, NSURL *outURL,
+                             UInt32 rate, UInt64 *outFrames, UInt64 *outNonZero) {
+    FILE *fa = fopen(aURL.path.fileSystemRepresentation, "rb");
+    FILE *fb = fopen(bURL.path.fileSystemRepresentation, "rb");
+    if (!fa || !fb) { if (fa) fclose(fa); if (fb) fclose(fb); return NO; }
+    if (fseek(fa, 44, SEEK_SET) != 0 || fseek(fb, 44, SEEK_SET) != 0) {
+        fclose(fa); fclose(fb); return NO;
+    }
+    [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil];
+    FILE *fo = fopen(outURL.path.fileSystemRepresentation, "wb");
+    if (!fo) { fclose(fa); fclose(fb); return NO; }
+    CRWavHeader(fo, rate, 2);
+    SInt16 x = 0, y = 0, pair[2];
+    UInt64 frames = 0, nonZero = 0;
+    while (fread(&x, sizeof(SInt16), 1, fa) == 1) {
+        if (fread(&y, sizeof(SInt16), 1, fb) != 1) y = 0;
+        pair[0] = x; pair[1] = y;
+        fwrite(pair, sizeof(SInt16), 2, fo);
+        if (x != 0 || y != 0) nonZero++;
+        frames++;
+    }
+    CRWavFinalize(fo, frames, 2);
+    fclose(fa); fclose(fb); fclose(fo);
+    if (outFrames)  *outFrames  = frames;
+    if (outNonZero) *outNonZero = nonZero;
+    return frames > 0;
+}
+
 #pragma mark - 单路采集通道
 
 @interface CaptureChannel : NSObject {
@@ -77,7 +138,16 @@ static UInt64 CRFileSize(NSURL *u) {
     AudioQueueRef               queue;
     AudioQueueBufferRef         buffers[kNumberOfBuffers];
     AudioFileID                 audioFile;
-    ExtAudioFileRef             extFile;   // v9.1: 直接写 AAC m4a 的保底输出（不经过 CAF 二次读取）
+    ExtAudioFileRef             extFile;   // v9.1 遗留（手动模式保留），v9.2 自动模式不再使用
+    FILE                       *wav;       // v9.2: PCM WAV 直写（无编码器）
+    SInt16                     *wavScratch;
+    UInt32                      wavScratchCap;
+    UInt32                      wavDown;   // 整数抽取系数 1/2/4
+    UInt32                      wavRate;   // 输出采样率
+    double                      wavAcc;
+    UInt32                      wavAccN;
+    UInt64                      wavFrames;
+    UInt64                      wavNonZero;
     UInt32                      bufferSize;
     SInt64                      currentPacket;
     int                         pid;
@@ -222,6 +292,8 @@ static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, UInt64
     NSURL *_spkURL;
     NSURL *_appURL;
     NSURL *_sysURL;
+    NSURL *_appWavURL;      // v9.2: 对方路临时 WAV
+    NSURL *_sysWavURL;      // v9.2: 系统混音路临时 WAV
     TRChannel _channel;
     BOOL _recording;
     BOOL _monitoring;
@@ -255,15 +327,19 @@ static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, UInt64
 }
 
 + (NSString *)qualityDescription:(TRQuality)q {
+    // v9.2 WAV 直写：44100 / ÷2 / ÷4，实际输出采样率
     switch (q) {
-        case TRQualityHigh:   return @"高清 44.1kHz · 约 0.6 MB/分";
-        case TRQualityNormal: return @"标准 22.05kHz · 约 0.35 MB/分";
+        case TRQualityHigh:   return @"高清 44.1kHz · 约 5.3 MB/分";
+        case TRQualityNormal: return @"标准 22.05kHz · 约 2.6 MB/分";
         case TRQualitySmall:
-        default:              return @"省空间 16kHz · 约 0.25 MB/分";
+        default:              return @"省空间 11.025kHz · 约 1.3 MB/分";
     }
 }
 
-- (NSInteger)outputSampleRate { return (NSInteger)SampleRateForQuality(_quality); }
+- (NSInteger)outputSampleRate {
+    UInt32 down = (_quality == TRQualityHigh) ? 1 : ((_quality == TRQualityNormal) ? 2 : 4);
+    return (NSInteger)(kTapSampleRate / down);
+}
 - (NSURL *)debugLogURL { return CRDebugLogURL(); }
 - (BOOL)isRecording { return _recording; }
 - (float)peakLevel { float m = _mic ? _mic->peak : 0; CaptureChannel *s = _autoMode ? _app : _spk; return m > (s?s->peak:0) ? m : (s?s->peak:0); }
@@ -322,6 +398,31 @@ static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef bu
         if (a > ch->peakEver) ch->peakEver = a;
         ch->sumSq += (double)s[i] * s[i];
         ch->sampleCount++;
+    }
+    // v9.2 ★决定性：同一份 PCM 直接写标准 WAV（Float32→Int16 整数抽取），
+    // 不经过 AAC 编码器、不经过 CAF、不经过二次打开。回调有数据 → 文件里就必然有波形。
+    if (ch->wav && ch->format.mBytesPerFrame > 0) {
+        UInt32 inCh = ch->format.mChannelsPerFrame ? ch->format.mChannelsPerFrame : 1;
+        UInt32 frames = buffer->mAudioDataByteSize / ch->format.mBytesPerFrame;
+        UInt32 outN = 0;
+        for (UInt32 i = 0; i < frames && outN < ch->wavScratchCap; i++) {
+            double v = 0;
+            for (UInt32 c = 0; c < inCh; c++) v += s[i * inCh + c];
+            v /= inCh;                       // 立体声先合成为单声道
+            ch->wavAcc += v; ch->wavAccN++;  // 累加平均 = 简易低通 + 整数抽取
+            if (ch->wavAccN >= ch->wavDown) {
+                double avg = ch->wavAcc / ch->wavAccN;
+                ch->wavAcc = 0; ch->wavAccN = 0;
+                if (avg > 1.0) avg = 1.0; else if (avg < -1.0) avg = -1.0;
+                SInt16 pcm = (SInt16)(avg * 32767.0);
+                ch->wavScratch[outN++] = pcm;
+                if (pcm != 0) ch->wavNonZero++;
+            }
+        }
+        if (outN > 0) {
+            fwrite(ch->wavScratch, sizeof(SInt16), outN, ch->wav);
+            ch->wavFrames += outN;
+        }
     }
     ch->totalBytes += buffer->mAudioDataByteSize;
     ch->callbacks++;
@@ -440,6 +541,30 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     return YES;
 }
 
+// v9.2 保底：给通道挂一份「回调直写 PCM WAV」输出。
+// down=1/2/4 → 44100/22050/11025 Hz（全部整数倍，无重采样插值误差）。
+- (BOOL)attachWavOutput:(NSURL *)url toChannel:(CaptureChannel *)ch down:(UInt32)down {
+    if (!url || !ch || down < 1) return NO;
+    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+    FILE *f = fopen(url.path.fileSystemRepresentation, "wb");
+    if (!f) { CRAppLog(@"[WAV] 打开失败 %@", url.lastPathComponent); return NO; }
+    UInt32 rate = (UInt32)(kTapSampleRate / down);
+    CRWavHeader(f, rate, 1);
+    ch->wav = f;
+    ch->wavDown = down;
+    ch->wavRate = rate;
+    ch->wavScratchCap = ch->bufferSize / (ch->format.mBytesPerFrame ?: 4) + 16;
+    ch->wavScratch = (SInt16 *)calloc(ch->wavScratchCap, sizeof(SInt16));
+    if (!ch->wavScratch) {
+        fclose(f); ch->wav = NULL;
+        CRAppLog(@"[WAV] 缓冲分配失败"); return NO;
+    }
+    CRAppLog(@"[WAV] 已挂接 %.0f→%uHz/%u ÷%u → %@",
+             kTapSampleRate, (unsigned)rate, (unsigned)ch->format.mChannelsPerFrame,
+             (unsigned)down, url.lastPathComponent);
+    return YES;
+}
+
 // v9：官方免费版配方 —— 按微信/QQ 真实进程 PID 做 app-tap
 - (BOOL)startAutoWithAppPIDs:(NSArray<NSNumber *> *)appPIDs
                      fileURL:(NSURL *)fileURL
@@ -455,35 +580,40 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
 
     NSString *base = [[fileURL lastPathComponent] stringByDeletingPathExtension];
     NSURL *dir = [fileURL URLByDeletingLastPathComponent];
-    _micURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_mic.caf"]];
-    _appURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_app.caf"]];
-    _sysURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_sys.caf"]];
-    _spkURL = nil;
+    // v9.2：自动模式彻底不用 CAF / AAC / ExtAudioFile，三路各自直接写 WAV
+    _micURL = nil; _appURL = nil; _sysURL = nil; _spkURL = nil;
+    _appWavURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_app.wav"]];
+    _sysWavURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_sys.wav"]];
+    // 44100 → ÷4=11025 / ÷2=22050 / ÷1=44100，全部整数抽取，无插值误差
+    UInt32 down = (_quality == TRQualityHigh) ? 1 : ((_quality == TRQualityNormal) ? 2 : 4);
 
-    // 自己：麦克风 -3（v5 已验证可用；★全程不激活 AVAudioSession★）
-    _mic = [self startChannelWithPID:kATAudioTapDescriptionPIDMicrophone channels:1 fileURL:_micURL error:error];
+    // 自己：麦克风 -3 → 直接写保底 WAV（最终主文件就是它，全程不覆盖、不转码）
+    _mic = [self startChannelWithPID:kATAudioTapDescriptionPIDMicrophone channels:1 fileURL:nil error:error];
     if (!_mic) { [self fail:@"麦克风通道启动失败" error:error]; return NO; }
+    BOOL wavOK = [self attachWavOutput:_outURL toChannel:_mic down:down];
+    CRAppLog(@"[WAV] 麦克风保底直写 %@", wavOK ? @"成功" : @"失败");
+    if (!wavOK) { [self fail:@"无法创建 WAV 文件" error:error]; return NO; }
 
-    // v9.1 ★保底：麦克风这一路直接写一份可播放的 m4a。
-    // 采集回调已由真机证明有数据（峰值 1.12），直写出来的文件一定有声音，
-    // 不再把成败押在「CAF→二次打开→格式转换→混音」这条链路上。
-    BOOL directOK = [self attachDirectOutput:_outURL toChannel:_mic];
-    CRAppLog(@"[保底] 麦克风直写m4a %@", directOK ? @"成功" : @"失败(由混音结果兜底)");
-
-    // 对方：真实进程 PID app-tap（官方 com.apple.coreaudio.app-tap 配方）
+    // 对方：真实进程 PID app-tap（临时 WAV，停止时择优）
     if (appPIDs.count > 0) {
-        _app = [self startChannelWithPIDs:appPIDs channels:2 fileURL:_appURL
+        _app = [self startChannelWithPIDs:appPIDs channels:2 fileURL:nil
                                  labelPid:appPIDs.firstObject.intValue error:nil];
-        if (_app) { _appTapActive = YES; CRLog(@"★app-tap 真实PID 启动成功: %@", appPIDs); }
+        if (_app) {
+            _appTapActive = YES;
+            [self attachWavOutput:_appWavURL toChannel:_app down:down];
+            CRLog(@"★app-tap 真实PID 启动成功: %@", appPIDs);
+        }
     }
     if (!_app) {
         CRLog(@"app-tap 不可用 → 回退 -2 系统混音");
-        _app = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker channels:2 fileURL:_appURL error:nil];
+        _app = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker channels:2 fileURL:nil error:nil];
+        if (_app) [self attachWavOutput:_appWavURL toChannel:_app down:down];
     }
 
     // 诊断/兜底：-2 系统混音。仅当 app-tap 成功时再开（避免同 PID 双队列）
     if (_appTapActive) {
-        _sys = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker channels:2 fileURL:_sysURL error:nil];
+        _sys = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker channels:2 fileURL:nil error:nil];
+        if (_sys) [self attachWavOutput:_sysWavURL toChannel:_sys down:down];
     } else {
         _sys = nil;
     }
@@ -541,6 +671,64 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     _recording = NO;
 
     NSFileManager *fm = [NSFileManager defaultManager];
+
+    // ============ v9.2 自动模式：纯 WAV 路径，绝不触碰 AAC / CAF / MixCAFs ============
+    if (_autoMode) {
+        UInt64 micFrames   = _mic ? _mic->wavFrames   : 0;
+        UInt64 micNonZero  = _mic ? _mic->wavNonZero  : 0;
+        UInt64 appNonZero  = _app ? _app->wavNonZero  : 0;
+        UInt64 sysNonZero  = _sys ? _sys->wavNonZero  : 0;
+        UInt64 micBytes    = CRFileSize(_outURL);
+        UInt32 rate        = _mic ? _mic->wavRate : 11025;
+        CRAppLog(@"[停止] WAV 主文件: 帧=%llu 非零样本=%llu 字节=%llu %uHz",
+                 micFrames, micNonZero, micBytes, (unsigned)rate);
+        CRAppLog(@"[停止] WAV 临时: app非零=%llu(%lluB) sys非零=%llu(%lluB) | 峰值 app=%.4f sys=%.4f",
+                 appNonZero, CRFileSize(_appWavURL), sysNonZero, CRFileSize(_sysWavURL),
+                 _app ? _app->peakEver : 0, _sys ? _sys->peakEver : 0);
+
+        // 对方路择优：真机已证明 -2 系统混音才是主路，按累计峰值选
+        float appPeak = _app ? _app->peakEver : 0;
+        float sysPeak = _sys ? _sys->peakEver : 0;
+        NSURL *other = nil;
+        if (_appTapActive && _sys && sysPeak >= appPeak && CRFileSize(_sysWavURL) > 44)
+            other = _sysWavURL;
+        else if (CRFileSize(_appWavURL) > 44)
+            other = _appWavURL;
+        else if (CRFileSize(_sysWavURL) > 44)
+            other = _sysWavURL;
+
+        NSString *base = [[_outURL lastPathComponent] stringByDeletingPathExtension];
+        NSURL *dir = [_outURL URLByDeletingLastPathComponent];
+        NSURL *stereoURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_双方.wav"]];
+        if (other && micBytes > 44) {
+            UInt64 frames = 0, nz = 0;
+            BOOL ok = CRMixWavToStereo(_outURL, other, stereoURL, rate, &frames, &nz);
+            CRAppLog(@"[停止] 立体声合成=%@ 帧=%llu 非零=%llu → %@",
+                     ok ? @"成功" : @"失败", frames, nz, stereoURL.lastPathComponent);
+            if (!ok || nz == 0) [fm removeItemAtURL:stereoURL error:nil];
+        }
+        CRAppLog(@"[停止] ★保底 WAV 原样保留: %@ (%lluB)，立体声另存同名 _双方.wav",
+                 _outURL.lastPathComponent, micBytes);
+
+        [fm removeItemAtURL:_appWavURL error:nil];
+        [fm removeItemAtURL:_sysWavURL error:nil];
+
+        if (micBytes > 44 && micNonZero > 0) {
+            CRLog(@"录音完成(WAV)：%@ (%lluB 非零=%llu)", _outURL.lastPathComponent, micBytes, micNonZero);
+            if ([_delegate respondsToSelector:@selector(recorderDidFinishWithURL:micLevel:speakerLevel:)])
+                [_delegate recorderDidFinishWithURL:_outURL
+                                          micLevel:_mic ? _mic->peakEver : 0
+                                      speakerLevel:_app ? _app->peakEver : 0];
+        } else {
+            CRAppLog(@"[停止] ★WAV 内无声音样本 —— 采集回调未写入数据");
+            if ([_delegate respondsToSelector:@selector(recorderDidFailWithMessage:)])
+                [_delegate recorderDidFailWithMessage:@"WAV 无声音数据"];
+        }
+        [self cleanup];
+        return;
+    }
+
+    // ============ 手动录音模式：沿用原 CAF→MixCAFs→m4a 链路 ============
     UInt64 micCafBytes = CRFileSize(_micURL);
     UInt64 appCafBytes = CRFileSize(_appURL);
     UInt64 sysCafBytes = CRFileSize(_sysURL);
@@ -638,6 +826,9 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     if (ch->audioFile) { AudioFileClose(ch->audioFile); ch->audioFile = 0; }
     if (ch->extFile) { ExtAudioFileDispose(ch->extFile); ch->extFile = NULL; }
     if (ch->queue) { AudioQueueDispose(ch->queue, true); ch->queue = NULL; }
+    // v9.2：所有回调都结束后，回填 WAV 头长度并关闭
+    if (ch->wav) { CRWavFinalize(ch->wav, ch->wavFrames, 1); fclose(ch->wav); ch->wav = NULL; }
+    if (ch->wavScratch) { free(ch->wavScratch); ch->wavScratch = NULL; }
     ch->tap = nil;
 }
 
