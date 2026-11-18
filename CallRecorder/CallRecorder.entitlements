@@ -23,6 +23,8 @@
 	<!-- 沙盒外运行（巨魔安装的 App 常配） -->
 	<key>com.apple.private.security.no-container</key>
 	<true/>
+	<key>com.apple.private.security.container-manager</key>
+	<true/>
 	<key>platform-application</key>
 	<true/>
 	<!-- 普通 App 基础权限 -->
