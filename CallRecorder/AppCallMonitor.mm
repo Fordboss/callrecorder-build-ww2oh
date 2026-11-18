@@ -23,20 +23,23 @@
 //   3. 「装上即用」：App 一启动就常驻录音，不做任何通话检测（本机已证实通知类信号全失效）。
 //   4. 麦克风路 -3、真实PID路 app-tap、-2 系统混音路 三路并行，按累计峰值择优。
 //   5. 出文件：采集回调里 Float32→Int16 直接写标准 PCM WAV，不经 AAC/CAF/混音。
-//   6. ★v9.4 决定性修正：本机私有 tap 队列「回调有触发但 buffer 恒为 0 字节」
-//      （不推流），这是自动模式始终不产生有效文件的根因。因此主路改用
-//      与「单点开始录音」完全相同的标准麦克风 AudioQueue（真机已验证出声），
-//      激活 AVAudioSession(PlayAndRecord + MixWithOthers，不强制外放)。
-//      app-tap / 系统混音降级为「对方声道增强」，有数据才合成 _双方.wav。
-//   7. 段长 60 秒：通话短于 120 秒也能在挂断后较快看到成段文件。
+//   6. ★v9.4：本机私有 tap 队列「回调有触发但 buffer 恒为 0 字节」（不推流），
+//      因此主路改用与「单点开始录音」相同的标准麦克风 AudioQueue（真机已验证出声）。
+//   7. ★v9.5 架构级修正（用户反馈「第一个通话有文件、后面没有」「时零时不灵」）：
+//      旧版每 60 秒 stop/start 整个引擎并反复激活/停用 AVAudioSession；且
+//      rotateSegment 的 `if (!isRecording) return` 一旦引擎被手动按钮 / 来电通知 /
+//      通知栏按钮停掉，就永久不再重启。
+//      本版：启动一次后队列与会话全程不重启，文件在采集回调内部按帧滚动
+//      （.part → .wav，只换 FILE*），并加每 5 秒看门狗：
+//        ① 引擎不在跑 → 立即重建；② 回调数 5 秒不增长 → 判队列卡死并重建。
+//      手动 / 来电 / 通知栏三条路径全部隔离，不再触碰常驻录音。
 // 不注入、不脱壳、不依赖任何会失效的通知 API。
 // ============================================================
 
 static NSString * const kThirdPartyAutoKey = @"CallRecorderThirdPartyAuto";
 static NSString * const kLogName = @"appcall_monitor.log";
-static const NSTimeInterval kSegmentSeconds = 60.0;   // v9.4 每段1分钟：通话挂断后更快成段可见
+static const NSTimeInterval kSegmentSeconds = 60.0;   // v9.5 回调内每 60 秒滚动出一个 WAV
 static const NSInteger kKeepSegments = 30;            // 保留最近30段(约30分钟)
-static const NSTimeInterval kPIDWatchSeconds = 15.0;  // PID 刷新周期
 
 #pragma mark - 进程枚举（真实 PID）
 
@@ -91,13 +94,10 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 }
 
 @interface AppCallMonitor ()
-@property (nonatomic, strong) NSTimer *segmentTimer;
-@property (nonatomic, strong) NSTimer *diagTimer;
-@property (nonatomic, strong) NSTimer *pidWatchTimer;
-@property (nonatomic, assign) NSInteger segmentIndex;
+@property (nonatomic, strong) NSTimer *diagTimer;      // v9.5 看门狗 + 实时电平（每5秒）
 @property (nonatomic, assign) NSInteger diagTick;
-@property (nonatomic, assign) float segmentPeak;        // 本段三路累计峰值（判静音）
-@property (nonatomic, copy)   NSString *activePIDSignature;
+@property (nonatomic, assign) NSInteger lastCallbackCount;   // 看门狗：上一次回调数
+@property (nonatomic, assign) NSInteger watchdogRestarts;   // 自愈次数（日志用）
 @end
 
 @implementation AppCallMonitor
@@ -149,136 +149,101 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 #pragma mark - 启动
 
 - (void)start {
-    [self log:@"===== 持续录音 v9.4 (标准麦克风主路 + WAV直写) 启动 ====="];
-    [self log:@"★主路修正: 本机 tap 缓冲区恒为0字节(不推流) → 自动模式改用已验证出声的标准麦克风队列"];
-    [self log:@"★会话: PlayAndRecord + MixWithOthers, 不强制外放, 不打断微信/QQ 通话路由"];
-    [self log:@"★出文件: 回调里 Float32→Int16→fwrite 写标准 WAV, 不经AAC/ExtAudioFile/CAF/混音编码"];
-    [self log:@"增强路: app-tap真实PID / -2系统混音, 有数据才合成 _双方.wav, 无数据不影响主文件"];
-    [self log:@"不注入/不脱壳, 装上即用, 每%.0f秒一段, 每%.0f秒刷新PID", kSegmentSeconds, kPIDWatchSeconds];
+    [self log:@"===== 常驻录音 v9.5 (单队列 + 看门狗自愈) 启动 ====="];
+    [self log:@"★根因: 旧版每60秒 stop/start 整引擎, rotateSegment 还有 if(!isRecording)return 守卫 → 一旦被停就永久不再录音"];
+    [self log:@"★本版: 启动一次, 队列/AVAudioSession 全程不重启; 文件在采集回调内每60秒滚动(.part→.wav)"];
+    [self log:@"★看门狗: 每5秒检查, 引擎停了或回调数不增长 → 立即重建, 根治『时零时不灵』"];
+    [self log:@"★隔离: 手动按钮 / 来电通知 / 通知栏按钮 均不再停止常驻录音"];
+    [self log:@"不注入/不脱壳, 装上即用, 每%.0f秒滚动一个WAV, 留最近%ld段", kSegmentSeconds, (long)kKeepSegments];
 
     NSArray<NSString *> *names = nil;
     NSArray<NSNumber *> *pids = FindCallAppPIDs(&names);
-    [self log:@"初始进程扫描: %ld个 | %@", (long)pids.count,
-          names.count ? [names componentsJoinedByString:@","] : @"(微信/QQ 尚未运行, 启动后会自动刷新)"];
+    (void)PIDSignature(pids);   // 仅记录，v9.5 不再用 PID 建 tap
+    [self log:@"进程扫描(仅记录): %@", names.count ? [names componentsJoinedByString:@","] : @"(微信/QQ 未运行)"];
 
-    if (self.thirdPartyAutoEnabled) {
-        [self startContinuousRecording];
-    } else {
-        [self log:@"自动开关关闭, 未启动录音"];
-    }
+    if (self.thirdPartyAutoEnabled) [self startContinuousRecording];
+    else [self log:@"自动开关关闭, 未启动录音"];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
         selector:@selector(onAppActive:) name:UIApplicationDidBecomeActiveNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self
         selector:@selector(onAppBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
 
-    // 三路实时诊断：每5秒一条，一眼看出哪条路抓到声音
+    // 每 5 秒：看门狗自愈 + 实时电平 + 定期清理旧段
     self.diagTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
                       target:self selector:@selector(diagTick:) userInfo:nil repeats:YES];
     [[NSRunLoop mainRunLoop] addTimer:self.diagTimer forMode:NSRunLoopCommonModes];
-
-    // PID 变化监听：微信/QQ 启动或重启后自动重建 tap，不用等切段
-    self.pidWatchTimer = [NSTimer scheduledTimerWithTimeInterval:kPIDWatchSeconds
-                          target:self selector:@selector(pidWatchTick:) userInfo:nil repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:self.pidWatchTimer forMode:NSRunLoopCommonModes];
 }
 
 - (void)diagTick:(NSTimer *)t {
     RecorderEngine *eng = [RecorderEngine shared];
-    if (!eng.isRecording) { [self log:@"[实时] 未录音"]; return; }
+    NSInteger cb = [eng callbackCount];
+    self.diagTick++;
+
+    // ★看门狗 1：自动开关开着但引擎没在跑 → 立即重建（旧版就是死在这里）
+    if (self.thirdPartyAutoEnabled && !eng.isRecording) {
+        [self log:@"[看门狗] 引擎已停止 → 立即重建常驻录音"];
+        self.lastCallbackCount = 0;
+        [self startContinuousRecording];
+        return;
+    }
+    // ★看门狗 2：引擎在跑但 5 秒内回调数完全不增长 → 队列卡死，重建
+    if (self.thirdPartyAutoEnabled && self.lastCallbackCount > 0 && cb == self.lastCallbackCount) {
+        self.watchdogRestarts++;
+        [self log:@"[看门狗] 5秒内回调无增长(回调=%ld, 队列卡死) → 停止并重建 第%ld次",
+              (long)cb, (long)self.watchdogRestarts];
+        [eng stop];
+        self.lastCallbackCount = 0;
+        [self startContinuousRecording];
+        return;
+    }
+    self.lastCallbackCount = cb;
+
+    if (!eng.isRecording) { [self log:@"[实时] 未录音(自动开关关闭)"]; return; }
     float mic = 0, app = 0, sys = 0;
     [eng consumeAutoLevelsMic:&mic app:&app sys:&sys];
-    float mx = fmaxf(mic, fmaxf(app, sys));
-    if (mx > self.segmentPeak) self.segmentPeak = mx;
-    self.diagTick++;
-    // 每 5 秒都写，方便回看通话那几秒；标注 app-tap 是否生效
-    [self log:@"[实时] mic=-3:%.4f app真实PID:%.4f sys混音:%.4f %@ | appTap=%@ | PID集=%@",
-          mic, app, sys, mx > 0.01 ? @"★有声音" : @"(静音)",
-          eng.appTapActive ? @"Y" : @"N", self.activePIDSignature ?: @"-"];
-}
+    [self log:@"[实时] mic=%.4f 回调=%ld 常驻=Y %@", mic, (long)cb,
+          mic > 0.01 ? @"★有声音" : @"(静音/环境音)"];
 
-- (void)pidWatchTick:(NSTimer *)t {
-    NSArray<NSNumber *> *pids = FindCallAppPIDs(NULL);
-    NSString *sig = PIDSignature(pids);
-    if (self.activePIDSignature && ![sig isEqualToString:self.activePIDSignature]) {
-        [self log:@"♻ PID 变化: [%@] → [%@], 立即切段重建 app-tap", self.activePIDSignature, sig];
-        [self rotateSegment];
-    }
+    if (self.diagTick % 24 == 0) [self cleanupOldSegments];
 }
 
 - (void)onAppActive:(NSNotification *)n {
-    [self log:@"App回到前台 | 录音中=%@ 第%ld段 appTap=%@",
-          [RecorderEngine shared].isRecording ? @"Y" : @"N", (long)self.segmentIndex,
-          [RecorderEngine shared].appTapActive ? @"Y" : @"N"];
+    RecorderEngine *eng = [RecorderEngine shared];
+    [self log:@"App回到前台 | 常驻录音=%@ 回调=%ld 自愈%ld次",
+          eng.isRecording ? @"Y" : @"N", (long)[eng callbackCount], (long)self.watchdogRestarts];
 }
 - (void)onAppBackground:(NSNotification *)n {
-    [self log:@"App进入后台 | 录音中=%@ (双路tap持续, 请勿强制杀后台)",
-          [RecorderEngine shared].isRecording ? @"Y" : @"N"];
+    RecorderEngine *eng = [RecorderEngine shared];
+    [self log:@"App进入后台 | 常驻录音=%@ 回调=%ld (队列持续, 请勿强制杀后台)",
+          eng.isRecording ? @"Y" : @"N", (long)[eng callbackCount]];
 }
 
 #pragma mark - 持续录音控制
 
 - (void)startContinuousRecording {
-    if ([[RecorderEngine shared] isRecording]) {
-        [self log:@"已在录音, 忽略重复启动"];
-        return;
-    }
-    self.segmentIndex++;
-    self.segmentPeak = 0;
+    RecorderEngine *eng = [RecorderEngine shared];
+    if (eng.isRecording) return;   // 单队列常驻，绝不重复启动
 
     NSDateFormatter *fmt = [NSDateFormatter new]; fmt.dateFormat = @"yyyyMMdd_HHmmss";
     NSString *name = [NSString stringWithFormat:@"rec_%@.wav", [fmt stringFromDate:[NSDate date]]];
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSURL *url = [NSURL fileURLWithPath:[docs stringByAppendingPathComponent:name]];
 
-    // ★核心：把微信/QQ 真实 PID 喂给 tap
-    NSArray<NSString *> *names = nil;
-    NSArray<NSNumber *> *pids = FindCallAppPIDs(&names);
-    self.activePIDSignature = PIDSignature(pids);
-    [self log:@"▶ 第%ld段 %@ | 主路=标准麦克风(确定出声) | 增强路PID(%ld): %@", (long)self.segmentIndex, name,
-          (long)pids.count, names.count ? [names componentsJoinedByString:@","] : @"(空→回退-2)"];
-
     NSError *err = nil;
-    BOOL ok = [[RecorderEngine shared] startAutoWithAppPIDs:pids fileURL:url error:&err];
-    [self log:@"   主路启动=%@ | 增强路 app-tap已创建=%@ (增强路无声属正常, 主路仍会出文件) %@", ok ? @"成功" : @"失败",
-          [RecorderEngine shared].appTapActive ? @"Y" : @"N", err.localizedDescription ?: @""];
-
-    [self.segmentTimer invalidate];
-    self.segmentTimer = [NSTimer scheduledTimerWithTimeInterval:kSegmentSeconds
-                         target:self selector:@selector(rotateSegment) userInfo:nil repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:self.segmentTimer forMode:NSRunLoopCommonModes];
-
-    if (!ok) {
-        __weak typeof(self) wf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (wf.thirdPartyAutoEnabled && ![[RecorderEngine shared] isRecording]) [wf startContinuousRecording];
-        });
-    }
-}
-
-- (void)rotateSegment {
-    if (![[RecorderEngine shared] isRecording]) return;
-    RecorderEngine *eng = [RecorderEngine shared];
-    [self log:@"⏱ 第%ld段结束 | 本段峰值=%.4f → %@ | appTap=%@",
-          (long)self.segmentIndex, self.segmentPeak,
-          self.segmentPeak > 0.01 ? @"★有声音(可能含通话)" : @"(静音/底噪)",
-          eng.appTapActive ? @"Y" : @"N"];
-
-    [eng stop];   // 同步收尾 WAV 头 + 纯字节合成（内部自动择优）
-    [self cleanupOldSegments];
-
-    __weak typeof(self) wf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (wf.thirdPartyAutoEnabled && ![[RecorderEngine shared] isRecording]) [wf startContinuousRecording];
-    });
+    BOOL ok = [eng startContinuousWithFileURL:url error:&err];
+    self.lastCallbackCount = 0;
+    [self log:@"▶ 常驻录音启动=%@ %@ | 单队列/单会话全程不重启, 每60秒滚动出一个WAV (基础名 %@)",
+          ok ? @"成功" : @"失败", err.localizedDescription ?: @"", name];
 }
 
 - (void)stopContinuousRecording {
-    [self.segmentTimer invalidate]; self.segmentTimer = nil;
-    if ([[RecorderEngine shared] isRecording]) {
-        [self log:@"⏹ 停止录音 | 本段峰值=%.4f", self.segmentPeak];
-        [[RecorderEngine shared] stop];
+    RecorderEngine *eng = [RecorderEngine shared];
+    if (eng.isRecording) {
+        [self log:@"⏹ 关闭自动开关 → 停止常驻录音并封存当前段"];
+        [eng stop];
     }
+    self.lastCallbackCount = 0;
 }
 
 - (void)cleanupOldSegments {
@@ -307,9 +272,7 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
-    [self.segmentTimer invalidate];
     [self.diagTimer invalidate];
-    [self.pidWatchTimer invalidate];
     [[RecorderEngine shared] stopMonitoring];
 }
 
