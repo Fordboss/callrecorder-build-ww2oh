@@ -152,7 +152,7 @@
     // 微信通话自动录音（需先注入 WeChatCallHook.dylib 到微信）
     UILabel *wxLbl = [[UILabel alloc] init];
     wxLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    wxLbl.text = @"③ 微信/QQ通话自动录音（免注入）";
+    wxLbl.text = @"③ 微信/QQ自动录音（app-tap 真实PID·免注入）";
     wxLbl.font = [UIFont systemFontOfSize:13];
     [self.view addSubview:wxLbl];
     UISwitch *wxSw = [[UISwitch alloc] init];
@@ -262,9 +262,9 @@
 - (void)toggleWeChatAuto:(UISwitch *)sw {
     [AppCallMonitor shared].thirdPartyAutoEnabled = sw.on;
     [self alert:sw.on
-        ? @"已开启【持续录音】：App 启动后全程双路录音（麦克风+对方），每5分钟自动存一个文件，只保留最近24段。\n\n微信/QQ/普通电话的通话声音都会被录进去——不依赖任何通话检测信号。请保持本 App 在后台运行（不要强杀）。\n\n打完电话点顶部『微信日志』，看最后几行的 mic/spk 电平：有数值说明录到了声音。"
-        : @"已关闭持续录音，已停止并保存当前段。"
-          title:@"持续录音"];
+        ? @"已开启【app-tap 自动录音】：装上即用，无需注入、无需脱壳。\n\n对标官方免费版配方——把微信/QQ 的真实进程 PID 喂给系统音频 tap（com.apple.coreaudio.app-tap），直接抓它们的 VoIP 音频流，不再走抓不到声音的系统混音。\n\nApp 启动后常驻三路录音（自己 -3 / 对方 真实PID / 系统混音 -2），停止时自动选有声音的那路合成 m4a，每2分钟存一段、只留最近30段。微信/QQ/电话通话都会录进去。\n\n请保持本 App 在后台（不要强杀）。打完电话点顶部『微信日志』，看 [实时] 行的 mic/app/sys 电平与 appTap=Y/N。"
+        : @"已关闭自动录音，已停止并保存当前段。"
+          title:@"app-tap 自动录音"];
 }
 
 // 悬浮球开关（TrollStore 权限下可浮在微信/QQ 之上）
