@@ -201,16 +201,16 @@
 
 #pragma mark - 录音
 
-- (void)startRecordAuto:(BOOL)auto {
+- (void)startRecordAuto:(BOOL)autoTriggered {
     if ([RecorderEngine shared].isRecording) return;
-    self.autoRecording = auto;
+    self.autoRecording = autoTriggered;
     TRChannel ch = TRChannelSystemAudio;
     if (self.channelPicker.selectedSegmentIndex == 1) ch = TRChannelMicrophone;
     else if (self.channelPicker.selectedSegmentIndex == 2) ch = TRChannelSpeaker;
 
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateFormat = @"yyyyMMdd_HHmmss";
-    NSString *prefix = auto ? @"auto_call" : @"call";
+    NSString *prefix = autoTriggered ? @"auto_call" : @"call";
     NSString *name = [NSString stringWithFormat:@"%@_%@.m4a", prefix, [fmt stringFromDate:[NSDate date]]];
     NSURL *url = [[self docsURL] URLByAppendingPathComponent:name];
 
@@ -221,7 +221,7 @@
     self.channelPicker.enabled = NO; self.qualityButton.enabled = NO;
     [self.recordButton setTitle:@"■  停止录音" forState:UIControlStateNormal];
     self.recordButton.backgroundColor = [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:1.0];
-    self.statusLabel.text = auto ? @"📞 来电自动录音中…" : @"录音中 · 双路采集中";
+    self.statusLabel.text = autoTriggered ? @"📞 来电自动录音中…" : @"录音中 · 双路采集中";
     self.timer = [NSTimer scheduledTimerWithTimeInterval:0.3 target:self selector:@selector(tick) userInfo:nil repeats:YES];
 }
 
