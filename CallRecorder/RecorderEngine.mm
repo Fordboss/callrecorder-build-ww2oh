@@ -60,7 +60,8 @@ static void CRLog(NSString *fmt, ...) {
     SInt64                      currentPacket;
     int                         pid;
     ATAudioTap                 *tap;
-    float                       peak;
+    float                       peak;      // 实时峰值（可被诊断消费清零）
+    float                       peakEver;  // 累计峰值（永不清零，停止时择优用）
     double                      sumSq;
     UInt64                      sampleCount;
     int                         callbacks;
@@ -178,14 +179,20 @@ static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, NSStri
 @interface RecorderEngine () {
     CaptureChannel *_mic;
     CaptureChannel *_spk;
+    CaptureChannel *_app;        // v9: 对方路（微信/QQ 真实进程 PID 的 app-tap）
+    CaptureChannel *_sys;        // v9: -2 系统混音诊断/兜底路
     CaptureChannel *_monMic;     // 监测通道（只算电平，不写盘）
     CaptureChannel *_monSpk;
     NSURL *_outURL;
     NSURL *_micURL;
     NSURL *_spkURL;
+    NSURL *_appURL;
+    NSURL *_sysURL;
     TRChannel _channel;
     BOOL _recording;
     BOOL _monitoring;
+    BOOL _autoMode;
+    BOOL _appTapActive;
 }
 @end
 
@@ -225,9 +232,23 @@ static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, NSStri
 - (NSInteger)outputSampleRate { return (NSInteger)SampleRateForQuality(_quality); }
 - (NSURL *)debugLogURL { return CRDebugLogURL(); }
 - (BOOL)isRecording { return _recording; }
-- (float)peakLevel { float m = _mic ? _mic->peak : 0; float s = _spk ? _spk->peak : 0; return m > s ? m : s; }
+- (float)peakLevel { float m = _mic ? _mic->peak : 0; CaptureChannel *s = _autoMode ? _app : _spk; return m > (s?s->peak:0) ? m : (s?s->peak:0); }
 - (float)micLevel { return _mic ? _mic->peak : 0; }
-- (float)speakerLevel { return _spk ? _spk->peak : 0; }
+- (float)speakerLevel { CaptureChannel *s = _autoMode ? _app : _spk; return s ? s->peak : 0; }
+- (float)appLevel { return _app ? _app->peak : 0; }
+- (float)systemLevel { return _sys ? _sys->peak : 0; }
+- (BOOL)appTapActive { return _appTapActive; }
+
+// 取 v9 三路电平并清零（用于每 5 秒诊断，判断哪条路真的抓到声音）
+- (void)consumeAutoLevelsMic:(float *)mic app:(float *)app sys:(float *)sys {
+    float m = _mic ? _mic->peak : 0;
+    float a = _app ? _app->peak : 0;
+    float s = _sys ? _sys->peak : 0;
+    if (_mic) _mic->peak = 0;
+    if (_app) _app->peak = 0;
+    if (_sys) _sys->peak = 0;
+    if (mic) *mic = m; if (app) *app = a; if (sys) *sys = s;
+}
 
 #pragma mark 采集回调
 
@@ -251,6 +272,7 @@ static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef bu
     for (UInt32 i = 0; i < count; i++) {
         Float32 a = fabsf(s[i]);
         if (a > ch->peak) ch->peak = a;
+        if (a > ch->peakEver) ch->peakEver = a;
         ch->sumSq += (double)s[i] * s[i];
         ch->sampleCount++;
     }
@@ -278,6 +300,11 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
 #pragma mark 启动单路
 
 - (CaptureChannel *)startChannelWithPID:(int)pid channels:(UInt32)channels fileURL:(NSURL *)url error:(NSError **)error {
+    return [self startChannelWithPIDs:@[@(pid)] channels:channels fileURL:url labelPid:pid error:error];
+}
+
+// v9 关键：PIDs 是数组 —— 可一次 tap 多个「真实进程 PID」（官方 app-tap 配方）
+- (CaptureChannel *)startChannelWithPIDs:(NSArray<NSNumber *> *)pids channels:(UInt32)channels fileURL:(NSURL *)url labelPid:(int)pid error:(NSError **)error {
     CaptureChannel *ch = [CaptureChannel new];
     ch->pid = pid;
     BOOL isMic = (pid == kATAudioTapDescriptionPIDMicrophone);
@@ -290,9 +317,10 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     // 官方 call-recorder.mm：initTapInternalWithFormat (iOS16+) + qtob
     ATAudioTapDescription *desc = nil;
     if ([ATAudioTapDescription instancesRespondToSelector:@selector(initTapInternalWithFormat:PIDs:)]) {
-        desc = [[ATAudioTapDescription alloc] initTapInternalWithFormat:af PIDs:@[@(pid)]];
+        desc = [[ATAudioTapDescription alloc] initTapInternalWithFormat:af PIDs:pids];
     } else {
-        desc = [[ATAudioTapDescription alloc] initProcessTapInternalWithFormat:af PID:pid];
+        // iOS 15 仅有单 PID 版本，取第一个
+        desc = [[ATAudioTapDescription alloc] initProcessTapInternalWithFormat:af PID:pids.firstObject.intValue];
     }
     ch->tap = [[ATAudioTap alloc] initWithTapDescription:desc];
     if (!ch->tap) { CRLog(@"★tap创建失败 pid=%d", pid); return nil; }
@@ -332,10 +360,60 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     return ch;
 }
 
+// v9：官方免费版配方 —— 按微信/QQ 真实进程 PID 做 app-tap
+- (BOOL)startAutoWithAppPIDs:(NSArray<NSNumber *> *)appPIDs
+                     fileURL:(NSURL *)fileURL
+                       error:(NSError **)error {
+    if (_recording) return YES;
+    if (_monitoring) [self stopMonitoring];
+    _autoMode = YES;
+    _appTapActive = NO;
+    CRLog(@"===== 开始 v9 app-tap 录音 iOS=%@ | PIDs=%@ =====",
+          [UIDevice currentDevice].systemVersion, appPIDs);
+    _channel = TRChannelSystemAudio;
+    _outURL = fileURL;
+
+    NSString *base = [[fileURL lastPathComponent] stringByDeletingPathExtension];
+    NSURL *dir = [fileURL URLByDeletingLastPathComponent];
+    _micURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_mic.caf"]];
+    _appURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_app.caf"]];
+    _sysURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_sys.caf"]];
+    _spkURL = nil;
+
+    // 自己：麦克风 -3（v5 已验证可用；★全程不激活 AVAudioSession★）
+    _mic = [self startChannelWithPID:kATAudioTapDescriptionPIDMicrophone channels:1 fileURL:_micURL error:error];
+    if (!_mic) { [self fail:@"麦克风通道启动失败" error:error]; return NO; }
+
+    // 对方：真实进程 PID app-tap（官方 com.apple.coreaudio.app-tap 配方）
+    if (appPIDs.count > 0) {
+        _app = [self startChannelWithPIDs:appPIDs channels:2 fileURL:_appURL
+                                 labelPid:appPIDs.firstObject.intValue error:nil];
+        if (_app) { _appTapActive = YES; CRLog(@"★app-tap 真实PID 启动成功: %@", appPIDs); }
+    }
+    if (!_app) {
+        CRLog(@"app-tap 不可用 → 回退 -2 系统混音");
+        _app = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker channels:2 fileURL:_appURL error:nil];
+    }
+
+    // 诊断/兜底：-2 系统混音。仅当 app-tap 成功时再开（避免同 PID 双队列）
+    if (_appTapActive) {
+        _sys = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker channels:2 fileURL:_sysURL error:nil];
+    } else {
+        _sys = nil;
+    }
+
+    _recording = YES;
+    CRLog(@"v9 通道: mic=%@ app=%@(真实PID=%@) sys=%@",
+          _mic?@"OK":@"FAIL", _app?@"OK":@"FAIL",
+          _appTapActive?@"Y":@"N", _sys?@"OK":@"N/A");
+    return _mic != nil;
+}
+
 - (BOOL)startWithChannel:(TRChannel)channel fileURL:(NSURL *)fileURL error:(NSError **)error {
     if (_recording) return YES;
     // 录音前先停监测，避免同 PID 两路 tap 冲突
     if (_monitoring) [self stopMonitoring];
+    _autoMode = NO;
     CRLog(@"========== 开始录音 v6 (双路混音+电平触发) iOS=%@ ==========", [UIDevice currentDevice].systemVersion);
     _channel = channel;
     _outURL = fileURL;
@@ -372,10 +450,27 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     // 先停队列（同步），再关文件，保证数据写全
     [self stopChannel:_mic];
     [self stopChannel:_spk];
+    [self stopChannel:_app];
+    [self stopChannel:_sys];
     _recording = NO;
 
     NSURL *in1 = self->_micURL;
-    NSURL *in2 = (_channel == TRChannelSystemAudio && self->_spkURL) ? self->_spkURL : nil;
+    NSURL *in2 = nil;
+    if (_autoMode) {
+        float appPeak = _app ? _app->peakEver : 0;
+        float sysPeak = _sys ? _sys->peakEver : 0;
+        if (_appTapActive && _sys) {
+            // ★自动择优：真实 PID 路 vs 系统混音路，谁有声音用谁
+            in2 = (appPeak >= sysPeak) ? self->_appURL : self->_sysURL;
+            CRLog(@"★v9择优: app-tap=%.4f sys混音=%.4f → 采用 %@",
+                  appPeak, sysPeak, in2.lastPathComponent);
+        } else {
+            in2 = self->_appURL ?: self->_spkURL;
+            CRLog(@"v9: 采用 %@ (回退路径)", in2.lastPathComponent);
+        }
+    } else {
+        in2 = (_channel == TRChannelSystemAudio && self->_spkURL) ? self->_spkURL : nil;
+    }
     Float64 sr = SampleRateForQuality(_quality);
     NSString *err = nil;
     CRLog(@"混音：%@ + %@ -> %@ @%.0fHz", in1.lastPathComponent, in2.lastPathComponent,
@@ -388,8 +483,12 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     } else {
         CRLog(@"✅混音完成：%@", _outURL.lastPathComponent);
         if ([_delegate respondsToSelector:@selector(recorderDidFinishWithURL:micLevel:speakerLevel:)])
-            [_delegate recorderDidFinishWithURL:_outURL micLevel:_mic?_mic->peak:0 speakerLevel:_spk?_spk->peak:0];
+            [_delegate recorderDidFinishWithURL:_outURL micLevel:_mic?_mic->peak:0 speakerLevel:_app?_app->peak:0];
     }
+    // 删除临时 CAF（避免 Documents 堆积 44.1k 未压缩大文件）
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSURL *temps[4] = { self->_micURL, self->_spkURL, self->_appURL, self->_sysURL };
+    for (int i = 0; i < 4; i++) if (temps[i]) [fm removeItemAtURL:temps[i] error:nil];
     [self cleanup];
 }
 
@@ -407,12 +506,14 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:-1
                                        userInfo:@{NSLocalizedDescriptionKey:msg}];
     [self stopChannel:_mic]; [self stopChannel:_spk];
-    _mic = nil; _spk = nil; _recording = NO;
+    [self stopChannel:_app]; [self stopChannel:_sys];
+    _mic = nil; _spk = nil; _app = nil; _sys = nil; _recording = NO;
 }
 
 - (void)cleanup {
     [self stopChannel:_mic]; [self stopChannel:_spk];
-    _mic = nil; _spk = nil; _recording = NO;
+    [self stopChannel:_app]; [self stopChannel:_sys];
+    _mic = nil; _spk = nil; _app = nil; _sys = nil; _recording = NO;
 }
 
 #pragma mark - 监测模式（电平触发，不写盘）
