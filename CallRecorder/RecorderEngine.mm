@@ -241,7 +241,7 @@ done:
 - (NSInteger)outputSampleRate { return (NSInteger)SampleRateForQuality(_quality); }
 - (NSURL *)debugLogURL { return CRDebugLogURL(); }
 - (BOOL)isRecording { return _recording; }
-- (float)peakLevel { return MAX(_mic ? _mic->peak : 0, _spk ? _spk->peak : 0); }
+- (float)peakLevel { float m = _mic ? _mic->peak : 0; float s = _spk ? _spk->peak : 0; return m > s ? m : s; }
 - (float)micLevel { return _mic ? _mic->peak : 0; }
 - (float)speakerLevel { return _spk ? _spk->peak : 0; }
 
