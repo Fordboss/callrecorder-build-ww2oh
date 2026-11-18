@@ -4,7 +4,6 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <sys/sysctl.h>
-#import <libproc.h>
 #import <math.h>
 
 // ============================================================
@@ -215,13 +214,11 @@ static NSString *BundleFromProcName(NSString *proc) {
         if (sysctl(mib, 4, procs, &size, NULL, 0) == 0) {
             int n = (int)(size / sizeof(struct kinfo_proc));
             for (int i = 0; i < n; i++) {
-                pid_t pid = procs[i].kp_proc.p_pid;
-                char pathbuf[PROC_PIDPATHINFO_MAXSIZE] = {0};
-                int ret = proc_pidpath(pid, pathbuf, sizeof(pathbuf));
-                if (ret > 0) {
-                    NSString *path = [NSString stringWithUTF8String:pathbuf];
-                    NSString *last = path.lastPathComponent;
-                    if (BundleFromProcName(last)) [out addObject:last];
+                // iOS 上用 kp_proc.p_comm 拿进程名（最多16字符，如 WeChat / MobileQQ）
+                char *comm = procs[i].kp_proc.p_comm;
+                if (comm[0]) {
+                    NSString *pname = [NSString stringWithUTF8String:comm];
+                    if (BundleFromProcName(pname) && ![out containsObject:pname]) [out addObject:pname];
                 }
             }
         }
