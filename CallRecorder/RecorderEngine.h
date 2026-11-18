@@ -39,6 +39,13 @@ typedef NS_ENUM(NSInteger, TRQuality) {
 - (BOOL)startAutoWithAppPIDs:(NSArray<NSNumber *> *)appPIDs
                      fileURL:(NSURL *)fileURL
                        error:(NSError **)error;
+
+// v9.5 ★常驻录音：启动一次后队列与 AVAudioSession 全程不重启，
+// 回调内部每 60 秒滚动出一个可直接播放的 WAV（.part → .wav）。
+// 只有关闭自动开关 / App 退出才 stop。
+- (BOOL)startContinuousWithFileURL:(NSURL *)fileURL error:(NSError **)error;
+// 看门狗用：采集回调累计次数（每 5 秒不增长即判为队列卡死）
+@property (nonatomic, readonly) NSInteger callbackCount;
 @property (nonatomic, readonly) float appLevel;      // 对方路(app-tap)电平
 @property (nonatomic, readonly) float systemLevel;   // 系统混音(-2)监测电平（诊断用）
 @property (nonatomic, readonly) BOOL  appTapActive;  // 是否成功用上真实 PID tap
