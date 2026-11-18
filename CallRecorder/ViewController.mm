@@ -182,7 +182,10 @@
         self.timer = nil;
         [self.recordButton setTitle:@"●  开始录音" forState:UIControlStateNormal];
         self.recordButton.backgroundColor = [UIColor systemRedColor];
-        self.statusLabel.text = @"已保存 · 点列表可播放";
+        float level = engine.peakLevel;
+        self.statusLabel.text = level < 0.001f
+            ? @"已保存 · ⚠️全程静音，试试『麦克风』通道说话"
+            : [NSString stringWithFormat:@"已保存 · 峰值电平 %.3f ✅有声音", level];
         self.channelPicker.enabled = YES;
         self.qualityButton.enabled = YES;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
@@ -210,7 +213,12 @@
 }
 
 - (void)tick {
-    self.statusLabel.text = @"录音中 · 点击停止保存";
+    float level = [[RecorderEngine shared] peakLevel];
+    NSString *bar = @"";
+    int blocks = MIN(20, (int)(level * 20));
+    for (int i = 0; i < blocks; i++) bar = [bar stringByAppendingString:@"█"];
+    if (blocks == 0) bar = @"（静音）";
+    self.statusLabel.text = [NSString stringWithFormat:@"录音中 · 电平 %.3f %@", level, bar];
 }
 
 #pragma mark - 文件

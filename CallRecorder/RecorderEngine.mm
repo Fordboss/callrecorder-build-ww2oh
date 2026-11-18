@@ -2,6 +2,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <UIKit/UIKit.h>
+#import <math.h>
 
 #import "ATAudioTap.h"
 #import "ATAudioTapDescription.h"
@@ -72,6 +73,9 @@ static void CRLog(NSString *fmt, ...) {
     BOOL                        _waitingDevice;
     UInt64                      _totalBytes;
     int                         _callbackCount;
+    float                       _peakLevel;     // 本次录音累计峰值
+    double                      _sumSquares;    // RMS 计算
+    UInt64                      _sampleCount;
 }
 @end
 
@@ -112,6 +116,7 @@ static void CRLog(NSString *fmt, ...) {
 - (NSInteger)outputSampleRate { return (NSInteger)SampleRateForQuality(_quality); }
 - (NSURL *)debugLogURL { return CRDebugLogURL(); }
 - (BOOL)isRecording { return _recording; }
+- (float)peakLevel { return _peakLevel; }
 
 #pragma mark 采集回调：tap 的 PCM -> ExtAudioFile（重采样+编码 AAC）
 
@@ -129,6 +134,17 @@ static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef bu
         OSStatus st = ExtAudioFileWrite(self->_extFile, frames, &list);
         if (st != noErr) CRLog(@"写入失败 ExtAudioFileWrite=%d frames=%u", (int)st, (unsigned)frames);
         self->_totalBytes += buffer->mAudioDataByteSize;
+
+        // 电平检测：tap 数据是 Float32，扫描出峰值与均方，用来判断是否静音
+        Float32 *samples = (Float32 *)buffer->mAudioData;
+        UInt32 count = buffer->mAudioDataByteSize / sizeof(Float32);
+        for (UInt32 i = 0; i < count; i++) {
+            Float32 v = samples[i];
+            Float32 a = fabsf(v);
+            if (a > self->_peakLevel) self->_peakLevel = a;
+            self->_sumSquares += (double)v * v;
+            self->_sampleCount++;
+        }
     }
     self->_callbackCount++;
     if (self->_callbackCount == 1) {
@@ -264,6 +280,9 @@ static void CalculateBufferSize(AudioQueueRef queue, AudioStreamBasicDescription
     _recording = YES;
     _totalBytes = 0;
     _callbackCount = 0;
+    _peakLevel = 0;
+    _sumSquares = 0;
+    _sampleCount = 0;
     return YES;
 }
 
@@ -282,7 +301,14 @@ static void CalculateBufferSize(AudioQueueRef queue, AudioStreamBasicDescription
 
 - (void)stop {
     if (!_recording && !_waitingDevice) { [self cleanup]; return; }
-    CRLog(@"停止录音：回调次数=%d 写入PCM字节=%llu", _callbackCount, _totalBytes);
+    double rms = _sampleCount > 0 ? sqrt(_sumSquares / (double)_sampleCount) : 0.0;
+    CRLog(@"停止录音：回调次数=%d 写入PCM字节=%llu 峰值=%.4f RMS=%.5f 采样点=%llu",
+          _callbackCount, _totalBytes, _peakLevel, rms, _sampleCount);
+    if (_peakLevel < 0.001f) {
+        CRLog(@"⚠️ 结论：全程几乎静音（tap 有数据但无声音）。若选的是『通话双方』，多为系统 tap 抓不到语音通道，请改用『麦克风』通道说几句话做对照。");
+    } else {
+        CRLog(@"✅ 结论：检测到有效声音（峰值 %.4f），录音内容非静音。", _peakLevel);
+    }
     AudioQueueStop(_queue, false);   // 非立即停止，让在途缓冲写完
     _recording = NO;
     _waitingDevice = NO;

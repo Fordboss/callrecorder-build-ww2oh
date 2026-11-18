@@ -25,6 +25,7 @@ typedef NS_ENUM(NSInteger, TRQuality) {
 @property (nonatomic, assign) TRQuality quality;                 // 运行时可改，下次录音生效
 @property (nonatomic, readonly) NSInteger outputSampleRate;      // 当前档位采样率
 @property (nonatomic, readonly) NSURL *debugLogURL;              // 诊断日志路径
+@property (nonatomic, readonly) float peakLevel;                 // 当前峰值电平（0~1+），用于判断是否静音
 
 + (NSString *)qualityDescription:(TRQuality)q;
 
