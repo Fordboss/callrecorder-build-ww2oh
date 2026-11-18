@@ -22,18 +22,20 @@
 //   2. 把这些 PID 一次性传给 initTapInternalWithFormat:PIDs:（官方同款）。
 //   3. 「装上即用」：App 一启动就常驻录音，不做任何通话检测（本机已证实通知类信号全失效）。
 //   4. 麦克风路 -3、真实PID路 app-tap、-2 系统混音路 三路并行，按累计峰值择优。
-//   5. ★v9.2 出文件：麦克风路在采集回调里直接写【标准 PCM WAV】（见 RecorderEngine），
-//      完全不经过 AAC 编码器 / ExtAudioFile / CAF 二次打开 / MixCAFs；
-//      保底 WAV 永不覆盖，对方路另做纯字节交叉合成 _双方.wav。
-//      两版「电平有值但文件静音」的根因就是出文件链，这版从结构上消除。
-//   6. PID 会随微信/QQ 重启变化 → 每 15 秒刷新，变化就切段重建 tap。
-// 不注入、不脱壳、不激活 AVAudioSession、不依赖任何会失效的通知 API。
+//   5. 出文件：采集回调里 Float32→Int16 直接写标准 PCM WAV，不经 AAC/CAF/混音。
+//   6. ★v9.4 决定性修正：本机私有 tap 队列「回调有触发但 buffer 恒为 0 字节」
+//      （不推流），这是自动模式始终不产生有效文件的根因。因此主路改用
+//      与「单点开始录音」完全相同的标准麦克风 AudioQueue（真机已验证出声），
+//      激活 AVAudioSession(PlayAndRecord + MixWithOthers，不强制外放)。
+//      app-tap / 系统混音降级为「对方声道增强」，有数据才合成 _双方.wav。
+//   7. 段长 60 秒：通话短于 120 秒也能在挂断后较快看到成段文件。
+// 不注入、不脱壳、不依赖任何会失效的通知 API。
 // ============================================================
 
 static NSString * const kThirdPartyAutoKey = @"CallRecorderThirdPartyAuto";
 static NSString * const kLogName = @"appcall_monitor.log";
-static const NSTimeInterval kSegmentSeconds = 120.0;  // 每段2分钟（更快刷新PID/更细粒度）
-static const NSInteger kKeepSegments = 20;            // v9.2 WAV 体积较大，收敛到最近20段(约40分钟)
+static const NSTimeInterval kSegmentSeconds = 60.0;   // v9.4 每段1分钟：通话挂断后更快成段可见
+static const NSInteger kKeepSegments = 30;            // 保留最近30段(约30分钟)
 static const NSTimeInterval kPIDWatchSeconds = 15.0;  // PID 刷新周期
 
 #pragma mark - 进程枚举（真实 PID）
@@ -147,11 +149,11 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 #pragma mark - 启动
 
 - (void)start {
-    [self log:@"===== 持续录音 v9.3 (队列入队修复 + PCM WAV) 启动 ====="];
-    [self log:@"★队列修复: 回调无条件重新入队, 只有 stopChannel 显式置位才停 (旧版3个buffer后饿死)"];
+    [self log:@"===== 持续录音 v9.4 (标准麦克风主路 + WAV直写) 启动 ====="];
+    [self log:@"★主路修正: 本机 tap 缓冲区恒为0字节(不推流) → 自动模式改用已验证出声的标准麦克风队列"];
+    [self log:@"★会话: PlayAndRecord + MixWithOthers, 不强制外放, 不打断微信/QQ 通话路由"];
     [self log:@"★出文件: 回调里 Float32→Int16→fwrite 写标准 WAV, 不经AAC/ExtAudioFile/CAF/混音编码"];
-    [self log:@"三路: 自己(-3) + 对方(真实PID) + 系统混音(-2), 停止时纯字节择优合成 _双方.wav"];
-    [self log:@"保底 WAV 永不覆盖; 播放前会激活 AVAudioSession(避免静音键导致听不到)"];
+    [self log:@"增强路: app-tap真实PID / -2系统混音, 有数据才合成 _双方.wav, 无数据不影响主文件"];
     [self log:@"不注入/不脱壳, 装上即用, 每%.0f秒一段, 每%.0f秒刷新PID", kSegmentSeconds, kPIDWatchSeconds];
 
     NSArray<NSString *> *names = nil;
@@ -233,14 +235,13 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
     NSArray<NSString *> *names = nil;
     NSArray<NSNumber *> *pids = FindCallAppPIDs(&names);
     self.activePIDSignature = PIDSignature(pids);
-    [self log:@"▶ 第%ld段 %@ | app-tap 目标PID(%ld): %@", (long)self.segmentIndex, name,
-          (long)pids.count, names.count ? [names componentsJoinedByString:@","] : @"(空→引擎回退-2)"];
+    [self log:@"▶ 第%ld段 %@ | 主路=标准麦克风(确定出声) | 增强路PID(%ld): %@", (long)self.segmentIndex, name,
+          (long)pids.count, names.count ? [names componentsJoinedByString:@","] : @"(空→回退-2)"];
 
     NSError *err = nil;
     BOOL ok = [[RecorderEngine shared] startAutoWithAppPIDs:pids fileURL:url error:&err];
-    [self log:@"   启动=%@ app-tap已创建=%@ %@", ok ? @"成功" : @"失败",
-          [RecorderEngine shared].appTapActive ? @"Y(该路是否有声音看实时电平)" : @"N(回退系统混音)",
-          err.localizedDescription ?: @""];
+    [self log:@"   主路启动=%@ | 增强路 app-tap已创建=%@ (增强路无声属正常, 主路仍会出文件) %@", ok ? @"成功" : @"失败",
+          [RecorderEngine shared].appTapActive ? @"Y" : @"N", err.localizedDescription ?: @""];
 
     [self.segmentTimer invalidate];
     self.segmentTimer = [NSTimer scheduledTimerWithTimeInterval:kSegmentSeconds
