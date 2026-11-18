@@ -75,6 +75,13 @@ static NSString * const kActStatus  = @"ACTION_STATUS";   // 查询状态
 
 - (void)handleAction:(NSString *)identifier {
     if ([identifier isEqualToString:kActRecord]) {
+        // ★v9.5：自动常驻录音运行时，通知栏按钮绝不能把它停掉
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        BOOL autoOn = [ud objectForKey:@"CallRecorderThirdPartyAuto"] ? [ud boolForKey:@"CallRecorderThirdPartyAuto"] : YES;
+        if (autoOn) {
+            NSLog(@"[Manual] 自动常驻录音运行中, 忽略通知栏按钮（不会停止录音）");
+            return;
+        }
         RecorderEngine *engine = [RecorderEngine shared];
         if (engine.isRecording) {
             [engine stop];
