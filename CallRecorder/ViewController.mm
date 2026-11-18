@@ -68,6 +68,19 @@
                                                  name:@"CallRecorderAutoStart" object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(autoStop)
                                                  name:@"CallRecorderAutoStop" object:nil];
+    // v9.5：常驻录音每滚动出一个 WAV 就刷新列表（前台也实时可见）
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onSegmentRolled:)
+                                                 name:@"CallRecorderSegmentRolled" object:nil];
+}
+
+- (void)onSegmentRolled:(NSNotification *)n {
+    dispatch_async(dispatch_get_main_queue(), ^{ [self loadFiles]; });
+}
+
+// v9.5：自动常驻录音开关是否开启（与 AppCallMonitor 共用同一个 key）
+- (BOOL)autoModeOn {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    return [ud objectForKey:@"CallRecorderThirdPartyAuto"] ? [ud boolForKey:@"CallRecorderThirdPartyAuto"] : YES;
 }
 
 - (void)dealloc { [[NSNotificationCenter defaultCenter] removeObserver:self]; }
@@ -161,7 +174,7 @@
     // 微信通话自动录音（需先注入 WeChatCallHook.dylib 到微信）
     UILabel *wxLbl = [[UILabel alloc] init];
     wxLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    wxLbl.text = @"③ 微信/QQ自动录音（v9.4 标准麦克风主路·免注入）";
+    wxLbl.text = @"③ 微信/QQ自动录音（v9.5 常驻+自愈·免注入）";
     wxLbl.font = [UIFont systemFontOfSize:13];
     [self.view addSubview:wxLbl];
     UISwitch *wxSw = [[UISwitch alloc] init];
@@ -271,9 +284,9 @@
 - (void)toggleWeChatAuto:(UISwitch *)sw {
     [AppCallMonitor shared].thirdPartyAutoEnabled = sw.on;
     [self alert:sw.on
-        ? @"已开启【v9.4 自动录音】：装上即用，无需注入、无需脱壳。\n\n★为什么之前一直没有文件：自动模式的麦克风走的是私有 tap，而这台设备上 tap 队列的回调缓冲区恒为 0 字节（不推流）；同时录音列表只在打开 App 时刷新，通话后切回来看到的还是旧列表。两点叠加，看起来就像「没有产生文件」。\n\n★本版：自动模式主路改用你已经单点验证成功的【标准麦克风队列】（PlayAndRecord + MixWithOthers，不强制外放、不打断微信/QQ 通话），每 60 秒存一段 WAV，主文件一定有声音；切回 App 会立即刷新列表。\n\napp-tap / 系统混音降级为对方声道增强，若该路有数据会另存 _双方.wav（左=自己 右=对方）；本机该路不推流属正常，不影响主文件。长按文件可选『文件体检』看峰值。"
-        : @"已关闭自动录音，已停止并保存当前段。"
-          title:@"v9.4 自动录音"];
+        ? @"已开启【v9.5 常驻自动录音】：装上即用，无需注入、无需脱壳。\n\n★为什么上版「第一个通话有文件、后面就没有」：旧版每 60 秒会 stop/start 整个引擎、反复激活/停用音频会话，而且切段函数有一句 `if (!isRecording) return` —— 一旦常驻录音被手动按钮、来电通知或通知栏按钮停掉，就永久不再重启。后台反复重建又导致『时零时不灵』。\n\n★本版架构级修复：App 启动只建一次标准麦克风队列 + 激活一次音频会话，之后全程不重启；文件在采集回调内部每 60 秒滚动封存（.part→.wav），列表实时刷新。另加每 5 秒看门狗：引擎被停或回调数不增长就立即重建。\n\n手动按钮、来电通知、通知栏按钮现在都不会停掉常驻录音。长按文件可选『文件体检』看峰值。"
+        : @"已关闭自动录音，当前段已封存为可播放的 WAV。"
+          title:@"v9.5 自动录音"];
 }
 
 // 悬浮球开关（TrollStore 权限下可浮在微信/QQ 之上）
@@ -334,11 +347,18 @@
 }
 
 - (void)toggleRecord {
+    // ★v9.5 隔离：自动常驻录音运行时，手动按钮绝不能停掉它
+    if ([self autoModeOn]) {
+        [self alert:@"自动录音正在常驻运行（开关三）。如需手动单点录音，请先关闭开关三。"
+              title:@"自动录音运行中"];
+        return;
+    }
     if ([RecorderEngine shared].isRecording) [self stopRecord];
     else [self startRecordAuto:NO];
 }
 
 - (void)stopRecord {
+    if ([self autoModeOn]) return;   // ★v9.5 保护常驻录音
     if (![RecorderEngine shared].isRecording) return;
     [[RecorderEngine shared] stop];   // 混音异步在引擎内做，完成后走 delegate
     [self.timer invalidate]; self.timer = nil;
@@ -350,8 +370,10 @@
 
 #pragma mark 自动录音通知
 
-- (void)autoStart { [self startRecordAuto:YES]; }
+- (void)autoStart { if ([self autoModeOn]) return; [self startRecordAuto:YES]; }
 - (void)autoStop {
+    // ★v9.5：来电/挂断通知不得停止常驻录音（旧版「第一个通话后就没文件」的元凶之一）
+    if ([self autoModeOn]) return;
     if ([RecorderEngine shared].isRecording && self.autoRecording) [self stopRecord];
 }
 
