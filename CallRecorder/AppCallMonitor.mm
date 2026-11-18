@@ -14,18 +14,17 @@
 //     TRCallMonitor 有 populateCallAttributes:...recordingClientPIDs:（复数）
 //     → 官方免费版录微信/QQ 是把「这些 App 的真实进程 PID」喂给 tap。
 //   * 权限 com.apple.coreaudio.app-tap = 按进程 tap 音频流（entitlements 已具备）。
-//   * 微信/QQ 的 VoIP 音频走自己的音频流，不经过 -2 系统混音总线
-//     —— 这正是 v1~v8 电平全程 0、录不到对方声音的根因。
+//   * v9 真机日志更正：app 真实 PID 那一路几乎全程 0，真正出声的是 -2 系统混音。
+//     所以「VoIP 不经过 -2」的推断不成立；-2 仍是对方声音的主路，app-tap 只作补充。
 //
 // 设计：
-//   1. sysctl(KERN_PROC_ALL) 枚举进程，抓出名字含 wechat / qq / voip 的真实 PID。
+//   1. sysctl(KERN_PROC_ALL) 枚举进程，只抓微信/QQ 主进程 PID（v9.1 排除扩展/Widget/QQMusic）。
 //   2. 把这些 PID 一次性传给 initTapInternalWithFormat:PIDs:（官方同款）。
-//   3. 「装上即用」：App 一启动就常驻双路录音（自己 -3 + 对方 真实PID），
-//      不做任何通话检测（前台/通知/MediaRemote 在本机已证实全部失效）。
-//   4. 麦克风路 -3、真实PID路 app-tap、-2 系统混音路 三路并行，
-//      停止混音时按累计峰值【自动择优】选有声音的那路 → 无论哪条通都能录到。
-//   5. PID 会随微信/QQ 重启变化 → 每 15 秒刷新，变化就切段重建 tap（装上即自动适配）。
-//   6. 采样率档位 / 自动分段 / 只留最近 N 段，全部沿用已验证框架。
+//   3. 「装上即用」：App 一启动就常驻录音，不做任何通话检测（本机已证实通知类信号全失效）。
+//   4. 麦克风路 -3、真实PID路 app-tap、-2 系统混音路 三路并行，按累计峰值择优。
+//   5. ★v9.1 保底：麦克风路在采集回调里直接写一份 AAC m4a（见 RecorderEngine），
+//      不再把文件成败押在「CAF→二次打开→格式转换→混音」链路上；混音成功才升级为立体声。
+//   6. PID 会随微信/QQ 重启变化 → 每 15 秒刷新，变化就切段重建 tap。
 // 不注入、不脱壳、不激活 AVAudioSession、不依赖任何会失效的通知 API。
 // ============================================================
 
@@ -61,10 +60,17 @@ static NSArray<NSNumber *> *FindCallAppPIDs(NSArray<NSString *> **outNames) {
         if (pid <= 0 || !comm) continue;
         NSString *nm = [NSString stringWithUTF8String:comm] ?: @"";
         NSString *low = nm.lowercaseString;
-        BOOL hit = [low containsString:@"wechat"]        // WeChat / WeChatNotificati / WeChatWidgetExte
-                || [low containsString:@"mobileqq"]      // MobileQQ
-                || [low containsString:@"voip"]          // 各类 VoIP 扩展
-                || [low hasPrefix:@"qq"];                // QQ / QQExtension
+        // v9.1：只保留微信/QQ 主进程。真机日志证实 v9 把通知扩展、Widget、
+        // QQMusic 等 7 个无关进程一起塞进 PIDs 数组，会稀释 app-tap 的输出。
+        BOOL helper = [low containsString:@"notific"]
+                   || [low containsString:@"widget"]
+                   || [low containsString:@"extension"]
+                   || [low containsString:@"music"]
+                   || [low containsString:@"share"]
+                   || [low containsString:@"today"];
+        BOOL hit = !helper && ([low hasPrefix:@"wechat"]   // WeChat 主进程
+                            || [low hasPrefix:@"mobileqq"] // MobileQQ
+                            || [low hasPrefix:@"qq"]);     // QQ 主进程
         if (hit) {
             [pids addObject:@(pid)];
             [names addObject:[NSString stringWithFormat:@"%@(%d)", nm, pid]];
@@ -139,9 +145,10 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 #pragma mark - 启动
 
 - (void)start {
-    [self log:@"===== 持续录音 v9 app-tap (真实进程PID) 启动 ====="];
-    [self log:@"配方: initTapInternalWithFormat:PIDs: ← 微信/QQ真实PID (官方app-tap), 不注入/不脱壳"];
-    [self log:@"三路: 自己(-3) + 对方(真实PID) + 系统混音(-2诊断), 停止时自动择优"];
+    [self log:@"===== 持续录音 v9.1 (保底直写 + app-tap) 启动 ====="];
+    [self log:@"配方: initTapInternalWithFormat:PIDs: ← 仅微信/QQ主进程PID, 不注入/不脱壳"];
+    [self log:@"三路: 自己(-3) + 对方(真实PID) + 系统混音(-2), 停止时自动择优"];
+    [self log:@"★保底: 麦克风PCM在回调里直接编码成m4a, 混音仅为立体声增强"];
     [self log:@"不激活AVAudioSession, 装上即用, 每%.0f秒一段, 每%.0f秒刷新PID", kSegmentSeconds, kPIDWatchSeconds];
 
     NSArray<NSString *> *names = nil;
@@ -228,8 +235,8 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 
     NSError *err = nil;
     BOOL ok = [[RecorderEngine shared] startAutoWithAppPIDs:pids fileURL:url error:&err];
-    [self log:@"   启动=%@ appTap真实PID=%@ %@", ok ? @"成功" : @"失败",
-          [RecorderEngine shared].appTapActive ? @"Y(官方配方生效)" : @"N(回退系统混音)",
+    [self log:@"   启动=%@ app-tap已创建=%@ %@", ok ? @"成功" : @"失败",
+          [RecorderEngine shared].appTapActive ? @"Y(该路是否有声音看实时电平)" : @"N(回退系统混音)",
           err.localizedDescription ?: @""];
 
     [self.segmentTimer invalidate];
