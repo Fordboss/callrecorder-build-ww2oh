@@ -39,5 +39,15 @@ typedef NS_ENUM(NSInteger, TRQuality) {
 @property (nonatomic, readonly) float micLevel;                  // 麦克风（自己）电平
 @property (nonatomic, readonly) float speakerLevel;              // 扬声器（对方）电平
 
+// 监测模式：常驻开 tap 只算电平不写盘，用于检测微信/QQ 通话是否有音频活动。
+// 触发录音前应 stopMonitoring，避免同 PID 两路 tap 冲突。
+- (BOOL)startMonitoringWithError:(NSError **)error;
+- (void)stopMonitoring;
+@property (nonatomic, readonly) BOOL isMonitoring;
+@property (nonatomic, readonly) float monitorMicLevel;      // 监测-麦克风电平
+@property (nonatomic, readonly) float monitorSpeakerLevel;  // 监测-扬声器电平
+// 取监测电平并清零（避免 peak 只增不减导致无法判断声音停止）
+- (void)consumeMonitorLevelsMic:(float *)mic speaker:(float *)spk;
+
 + (NSString *)qualityDescription:(TRQuality)q;
 @end
