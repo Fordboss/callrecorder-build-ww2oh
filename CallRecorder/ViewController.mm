@@ -4,6 +4,7 @@
 #import "ManualControl.h"
 #import "FloatingBall.h"
 #import "DarwinMonitor.h"
+#import "AppCallMonitor.h"
 #import <AVFoundation/AVFoundation.h>
 #import <Speech/Speech.h>
 
@@ -74,12 +75,18 @@
     self.navigationItem.rightBarButtonItems = @[ recLog, wxLog ];
 }
 - (void)shareWeChatLog {
+    // 免注入检测日志为主（appcall_monitor.log），旧的注入日志为辅
+    NSURL *newURL = [AppCallMonitor shared].logURL;
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSURL *url = [NSURL fileURLWithPath:[docs stringByAppendingPathComponent:@"wechat_auto.log"]];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
-        [self alert:@"还没有微信日志。注入 hook 后打一通微信电话，再回来看这个日志。" title:@"微信自动录音日志"]; return;
+    NSURL *oldURL = [NSURL fileURLWithPath:[docs stringByAppendingPathComponent:@"wechat_auto.log"]];
+    NSString *newText = [[AppCallMonitor shared] recentLog:120];
+    if (newText.length == 0 && ![[NSFileManager defaultManager] fileExistsAtPath:oldURL.path]) {
+        [self alert:@"还没有日志。保持本 App 在后台，打一通微信/QQ电话后回来看。" title:@"自动录音诊断日志"]; return;
     }
-    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    NSMutableArray *items = [NSMutableArray array];
+    if (newText.length) [items addObject:newText];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:oldURL.path]) [items addObject:oldURL];
+    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:items applicationActivities:nil];
     av.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
     [self presentViewController:av animated:YES completion:nil];
 }
@@ -145,12 +152,12 @@
     // 微信通话自动录音（需先注入 WeChatCallHook.dylib 到微信）
     UILabel *wxLbl = [[UILabel alloc] init];
     wxLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    wxLbl.text = @"③ 微信通话自动录音（需注入hook）";
+    wxLbl.text = @"③ 微信/QQ通话自动录音（免注入）";
     wxLbl.font = [UIFont systemFontOfSize:13];
     [self.view addSubview:wxLbl];
     UISwitch *wxSw = [[UISwitch alloc] init];
     wxSw.translatesAutoresizingMaskIntoConstraints = NO;
-    wxSw.on = [DarwinMonitor shared].wechatAutoEnabled;
+    wxSw.on = [AppCallMonitor shared].thirdPartyAutoEnabled;
     [wxSw addTarget:self action:@selector(toggleWeChatAuto:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:wxSw]; self.wxSwitch = wxSw;
 
@@ -251,13 +258,13 @@
           title:@"微信/QQ 手动录音助手"];
 }
 
-// 微信通话自动录音开关（依赖 WeChatCallHook.dylib 已注入微信）
+// 微信/QQ 通话自动录音开关（官方同款免注入检测）
 - (void)toggleWeChatAuto:(UISwitch *)sw {
-    [DarwinMonitor shared].wechatAutoEnabled = sw.on;
+    [AppCallMonitor shared].thirdPartyAutoEnabled = sw.on;
     [self alert:sw.on
-        ? @"已开启：微信来电接通后自动双路录音，挂断自动保存。\n\n前提：必须用 TrollFools 把 WeChatCallHook.dylib 注入微信（见说明文档）。没注入则不会触发。"
-        : @"已关闭微信通话自动录音。"
-          title:@"微信自动录音"];
+        ? @"已开启：微信/QQ 来电接通后自动双路录音，挂断自动保存。\n\n无需注入、无需脱壳——和官方一样靠系统级音频检测。请保持本 App 在后台运行（不要强杀），打一通微信电话测试；若没触发，点顶部『微信日志』发我校准。"
+        : @"已关闭微信/QQ通话自动录音。"
+          title:@"微信/QQ自动录音"];
 }
 
 // 悬浮球开关（TrollStore 权限下可浮在微信/QQ 之上）
