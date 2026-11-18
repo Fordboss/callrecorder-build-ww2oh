@@ -3,6 +3,7 @@
 #import "CallMonitor.h"
 #import "ManualControl.h"
 #import "DarwinMonitor.h"
+#import "AppCallMonitor.h"
 
 @implementation AppDelegate
 
@@ -18,7 +19,9 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     [[CallMonitor shared] start];
     // 手动录音助手：注册通知 category + 代理（尽早，保证后台点击能响应）
     [[ManualControl shared] setup];
-    // 微信通话自动录音：监听 hook dylib 发出的 Darwin 通知
+    // 微信/QQ 通话自动录音：官方同款免注入检测（前台App+音频中断），无需注入微信
+    [[AppCallMonitor shared] start];
+    // 兼容旧的注入通知通道（若用户已注入 dylib，多一层保险）
     [[DarwinMonitor shared] start];
     return YES;
 }
