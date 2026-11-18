@@ -28,16 +28,6 @@ static Float64 SampleRateForQuality(TRQuality q) {
         default:              return 16000.0;
     }
 }
-// AAC 目标码率
-static UInt32 BitrateForQuality(TRQuality q) {
-    switch (q) {
-        case TRQualityHigh:   return 96000;
-        case TRQualityNormal: return 64000;
-        case TRQualitySmall:
-        default:              return 32000;
-    }
-}
-
 #pragma mark - 诊断日志
 
 static NSURL *CRDebugLogURL(void) {
@@ -85,107 +75,98 @@ static void CRLog(NSString *fmt, ...) {
 
 // 把两路 Float32 CAF 重采样 + 合成为单文件 AAC/m4a。
 // input2 为 nil 时：单路，左右声道都写 input1。
-static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, UInt32 bitrate, NSString **errMsg) {
+#define CRMAX(a,b) ((a)>(b)?(a):(b))
+static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, NSString **errMsg) {
+    // 所有变量在顶部声明，避免 C++ 下 goto 跨越初始化
     ExtAudioFileRef f1 = NULL, f2 = NULL, fout = NULL;
-    AudioStreamBasicDescription clientFmt = {0}, outFmt = {0};
+    AudioStreamBasicDescription clientFmt = {0}, outFmt = {0}, writeFmt = {0};
+    AudioChannelLayout layout = {0};
+    SInt16 *b1 = NULL, *b2 = NULL, *bo = NULL;
+    AudioBufferList abl1 = {0}, abl2 = {0}, ablo = {0};
     OSStatus st = noErr;
     BOOL ok = NO;
+    UInt32 sz = 0;
     const UInt32 framesPerBuf = 8192;
-#define CRMAX(a,b) ((a)>(b)?(a):(b))
 
-    st = ExtAudioFileOpenURL((__bridge CFURLRef)in1, &f1);
-    if (st != noErr) { if (errMsg) *errMsg = [NSString stringWithFormat:@"打开输入1失败 %d", (int)st]; goto done; }
-    if (in2) {
-        st = ExtAudioFileOpenURL((__bridge CFURLRef)in2, &f2);
-        if (st != noErr) { if (errMsg) *errMsg = [NSString stringWithFormat:@"打开输入2失败 %d", (int)st]; goto done; }
-    }
-
-    // 读取端：统一转成 Int16 / 目标采样率 / 单声道（每路各自读）
-    clientFmt.mSampleRate       = outSR;
-    clientFmt.mFormatID         = kAudioFormatLinearPCM;
-    clientFmt.mFormatFlags      = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-    clientFmt.mFramesPerPacket  = 1;
-    clientFmt.mChannelsPerFrame = 1;
-    clientFmt.mBitsPerChannel   = 16;
-    clientFmt.mBytesPerFrame    = 2;
-    clientFmt.mBytesPerPacket   = 2;
-
-    ExtAudioFileSetProperty(f1, kExtAudioFileProperty_ClientDataFormat, sizeof(clientFmt), &clientFmt);
-    if (f2) ExtAudioFileSetProperty(f2, kExtAudioFileProperty_ClientDataFormat, sizeof(clientFmt), &clientFmt);
-
-    // 输出：AAC / 立体声 / 目标采样率
-    outFmt.mSampleRate       = outSR;
-    outFmt.mFormatID         = kAudioFormatMPEG4AAC;
-    outFmt.mChannelsPerFrame = 2;
-    UInt32 sz = sizeof(outFmt);
-    st = AudioFormatGetProperty(kAudioFormatProperty_FormatInfo, 0, NULL, &sz, &outFmt);
-    if (st != noErr) { if (errMsg) *errMsg = [NSString stringWithFormat:@"FormatInfo失败 %d", (int)st]; goto done; }
-
-    AudioChannelLayout layout = {0};
-    layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
-    st = ExtAudioFileCreateWithURL((__bridge CFURLRef)outURL, kAudioFileM4AType, &outFmt, &layout,
-                                   kAudioFileFlags_EraseFile, &fout);
-    if (st != noErr) { if (errMsg) *errMsg = [NSString stringWithFormat:@"创建m4a失败 %d", (int)st]; goto done; }
-
-    // 写入端用 Int16 立体声，由 ExtAudioFile 编码为 AAC
-    AudioStreamBasicDescription writeFmt = clientFmt;
-    writeFmt.mChannelsPerFrame = 2;
-    writeFmt.mBytesPerFrame    = 4;
-    writeFmt.mBytesPerPacket   = 4;
-    ExtAudioFileSetProperty(fout, kExtAudioFileProperty_ClientDataFormat, sizeof(writeFmt), &writeFmt);
-    UInt32 quality = 0; // 0=最大压缩率优先(体积); 用码率控制
-    ExtAudioFileSetProperty(fout, kExtAudioFileProperty_EncoderQuality, sizeof(quality), &quality);
-    ExtAudioFileSetProperty(fout, kExtAudioFileProperty_EncoderBitRate, sizeof(bitrate), &bitrate);
-
-    // 缓冲区（每路单声道 Int16，输出立体声 Int16）
-    SInt16 *b1 = (SInt16 *)calloc(framesPerBuf, sizeof(SInt16));
-    SInt16 *b2 = (SInt16 *)calloc(framesPerBuf, sizeof(SInt16));
-    SInt16 *bo = (SInt16 *)calloc(framesPerBuf * 2, sizeof(SInt16));
-    if (!b1 || !b2 || !bo) { free(b1); free(b2); free(bo); if (errMsg) *errMsg = @"内存分配失败"; goto done; }
-
-    AudioBufferList abl1 = {0}; abl1.mNumberBuffers = 1;
-    abl1.mBuffers[0].mNumberChannels = 1;
-    abl1.mBuffers[0].mDataByteSize = framesPerBuf * sizeof(SInt16);
-    abl1.mBuffers[0].mData = b1;
-    AudioBufferList abl2 = {0}; abl2.mNumberBuffers = 1;
-    abl2.mBuffers[0].mNumberChannels = 1;
-    abl2.mBuffers[0].mDataByteSize = framesPerBuf * sizeof(SInt16);
-    abl2.mBuffers[0].mData = b2;
-    AudioBufferList ablo = {0}; ablo.mNumberBuffers = 1;
-    ablo.mBuffers[0].mNumberChannels = 2;
-    ablo.mBuffers[0].mDataByteSize = framesPerBuf * 2 * sizeof(SInt16);
-    ablo.mBuffers[0].mData = bo;
-
-    while (1) {
-        UInt32 n1 = framesPerBuf, n2 = framesPerBuf;
-        st = ExtAudioFileRead(f1, &n1, &abl1);
-        if (st != noErr) { CRLog(@"混音读输入1失败 %d", (int)st); break; }
-        if (f2) {
-            st = ExtAudioFileRead(f2, &n2, &abl2);
-            if (st != noErr) { CRLog(@"混音读输入2失败 %d", (int)st); break; }
-        } else {
-            n2 = n1; // 单路：右声道复制左声道
+    do {
+        st = ExtAudioFileOpenURL((__bridge CFURLRef)in1, &f1);
+        if (st != noErr) { if (errMsg) *errMsg = [NSString stringWithFormat:@"打开输入1失败 %d", (int)st]; break; }
+        if (in2) {
+            st = ExtAudioFileOpenURL((__bridge CFURLRef)in2, &f2);
+            if (st != noErr) { if (errMsg) *errMsg = [NSString stringWithFormat:@"打开输入2失败 %d", (int)st]; break; }
         }
-        if (n1 == 0 && n2 == 0) break;
 
-        UInt32 frames = CRMAX(n1, n2);
-        for (UInt32 i = 0; i < frames; i++) {
-            SInt16 l = (i < n1) ? b1[i] : 0;
-            SInt16 r;
-            if (f2) r = (i < n2) ? b2[i] : 0;
-            else    r = l;                 // 单路复制到双声道
-            bo[i*2]   = l;                 // 左：麦克风（自己）
-            bo[i*2+1] = r;                 // 右：扬声器（对方）
+        // 读取端：统一转成 Int16 / 目标采样率 / 单声道
+        clientFmt.mSampleRate       = outSR;
+        clientFmt.mFormatID         = kAudioFormatLinearPCM;
+        clientFmt.mFormatFlags      = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+        clientFmt.mFramesPerPacket  = 1;
+        clientFmt.mChannelsPerFrame = 1;
+        clientFmt.mBitsPerChannel   = 16;
+        clientFmt.mBytesPerFrame    = 2;
+        clientFmt.mBytesPerPacket   = 2;
+        ExtAudioFileSetProperty(f1, kExtAudioFileProperty_ClientDataFormat, sizeof(clientFmt), &clientFmt);
+        if (f2) ExtAudioFileSetProperty(f2, kExtAudioFileProperty_ClientDataFormat, sizeof(clientFmt), &clientFmt);
+
+        // 输出：AAC / 立体声 / 目标采样率（码率由系统按采样率自动选，降采样率即减小体积）
+        outFmt.mSampleRate       = outSR;
+        outFmt.mFormatID         = kAudioFormatMPEG4AAC;
+        outFmt.mChannelsPerFrame = 2;
+        sz = sizeof(outFmt);
+        st = AudioFormatGetProperty(kAudioFormatProperty_FormatInfo, 0, NULL, &sz, &outFmt);
+        if (st != noErr) { if (errMsg) *errMsg = [NSString stringWithFormat:@"FormatInfo失败 %d", (int)st]; break; }
+
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
+        st = ExtAudioFileCreateWithURL((__bridge CFURLRef)outURL, kAudioFileM4AType, &outFmt, &layout,
+                                       kAudioFileFlags_EraseFile, &fout);
+        if (st != noErr) { if (errMsg) *errMsg = [NSString stringWithFormat:@"创建m4a失败 %d", (int)st]; break; }
+
+        // 写入端用 Int16 立体声，由 ExtAudioFile 编码为 AAC
+        writeFmt = clientFmt;
+        writeFmt.mChannelsPerFrame = 2;
+        writeFmt.mBytesPerFrame    = 4;
+        writeFmt.mBytesPerPacket   = 4;
+        ExtAudioFileSetProperty(fout, kExtAudioFileProperty_ClientDataFormat, sizeof(writeFmt), &writeFmt);
+
+        b1 = (SInt16 *)calloc(framesPerBuf, sizeof(SInt16));
+        b2 = (SInt16 *)calloc(framesPerBuf, sizeof(SInt16));
+        bo = (SInt16 *)calloc(framesPerBuf * 2, sizeof(SInt16));
+        if (!b1 || !b2 || !bo) { if (errMsg) *errMsg = @"内存分配失败"; break; }
+
+        abl1.mNumberBuffers = 1; abl1.mBuffers[0].mNumberChannels = 1;
+        abl1.mBuffers[0].mDataByteSize = framesPerBuf * sizeof(SInt16); abl1.mBuffers[0].mData = b1;
+        abl2.mNumberBuffers = 1; abl2.mBuffers[0].mNumberChannels = 1;
+        abl2.mBuffers[0].mDataByteSize = framesPerBuf * sizeof(SInt16); abl2.mBuffers[0].mData = b2;
+        ablo.mNumberBuffers = 1; ablo.mBuffers[0].mNumberChannels = 2;
+        ablo.mBuffers[0].mDataByteSize = framesPerBuf * 2 * sizeof(SInt16); ablo.mBuffers[0].mData = bo;
+
+        while (1) {
+            UInt32 n1 = framesPerBuf, n2 = framesPerBuf;
+            st = ExtAudioFileRead(f1, &n1, &abl1);
+            if (st != noErr) { CRLog(@"混音读输入1失败 %d", (int)st); break; }
+            if (f2) {
+                st = ExtAudioFileRead(f2, &n2, &abl2);
+                if (st != noErr) { CRLog(@"混音读输入2失败 %d", (int)st); break; }
+            } else {
+                n2 = n1; // 单路：右声道复制左声道
+            }
+            if (n1 == 0 && n2 == 0) break;
+
+            UInt32 frames = CRMAX(n1, n2);
+            for (UInt32 i = 0; i < frames; i++) {
+                SInt16 l = (i < n1) ? b1[i] : 0;
+                SInt16 r = f2 ? ((i < n2) ? b2[i] : 0) : l;
+                bo[i*2]   = l;   // 左：麦克风（自己）
+                bo[i*2+1] = r;   // 右：扬声器（对方）
+            }
+            ablo.mBuffers[0].mDataByteSize = frames * 2 * sizeof(SInt16);
+            st = ExtAudioFileWrite(fout, frames, &ablo);
+            if (st != noErr) { CRLog(@"混音写输出失败 %d", (int)st); break; }
         }
-        ablo.mBuffers[0].mDataByteSize = frames * 2 * sizeof(SInt16);
-        UInt32 framesToWrite = frames;
-        st = ExtAudioFileWrite(fout, framesToWrite, &ablo);
-        if (st != noErr) { CRLog(@"混音写输出失败 %d", (int)st); break; }
-    }
+        ok = YES;
+    } while (0);
+
     free(b1); free(b2); free(bo);
-    ok = YES;
-
-done:
     if (f1) ExtAudioFileDispose(f1);
     if (f2) ExtAudioFileDispose(f2);
     if (fout) ExtAudioFileDispose(fout);
@@ -383,11 +364,10 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     NSURL *in1 = self->_micURL;
     NSURL *in2 = (_channel == TRChannelSystemAudio && self->_spkURL) ? self->_spkURL : nil;
     Float64 sr = SampleRateForQuality(_quality);
-    UInt32 br = BitrateForQuality(_quality);
     NSString *err = nil;
-    CRLog(@"混音：%@ + %@ -> %@ @%.0fHz %ubps", in1.lastPathComponent, in2.lastPathComponent,
-          _outURL.lastPathComponent, sr, (unsigned)br);
-    BOOL ok = MixCAFs(in1, in2, _outURL, sr, br, &err);
+    CRLog(@"混音：%@ + %@ -> %@ @%.0fHz", in1.lastPathComponent, in2.lastPathComponent,
+          _outURL.lastPathComponent, sr);
+    BOOL ok = MixCAFs(in1, in2, _outURL, sr, &err);
     if (!ok) {
         CRLog(@"★混音失败：%@", err);
         if ([_delegate respondsToSelector:@selector(recorderDidFailWithMessage:)])
