@@ -30,6 +30,21 @@ typedef NS_ENUM(NSInteger, TRQuality) {
                    error:(NSError **)error;
 - (void)stop;                                       // 停止并混音，结果走 delegate
 
+// v9 核心：按微信/QQ「真实进程 PID」做 app-tap（官方免费版录第三方 App 的配方）。
+//  - 自己(麦克风)：PID -3，一直可用
+//  - 对方(微信/QQ 播放的语音)：不再用 -2 系统混音，改用 appPIDs 里的真实进程 PID
+//  - 同时开一路 -2 系统混音「监测通道」(不写盘，只报电平)，用于诊断哪条路有声音
+//  - appPIDs 为空 / 真实 PID tap 创建失败 → 自动回退 -2，保证至少有一路
+//  - 采样率档位 (quality) 在停止混音时生效，与上面所有版本一致
+- (BOOL)startAutoWithAppPIDs:(NSArray<NSNumber *> *)appPIDs
+                     fileURL:(NSURL *)fileURL
+                       error:(NSError **)error;
+@property (nonatomic, readonly) float appLevel;      // 对方路(app-tap)电平
+@property (nonatomic, readonly) float systemLevel;   // 系统混音(-2)监测电平（诊断用）
+@property (nonatomic, readonly) BOOL  appTapActive;  // 是否成功用上真实 PID tap
+// 取三路实时电平并清零（每 5 秒诊断：哪条路真的抓到声音）
+- (void)consumeAutoLevelsMic:(float *)mic app:(float *)app sys:(float *)sys;
+
 @property (nonatomic, weak)   id<RecorderEngineDelegate> delegate;
 @property (nonatomic, readonly) BOOL isRecording;
 @property (nonatomic, assign) TRQuality quality;                 // 运行时可改，下次录音生效
