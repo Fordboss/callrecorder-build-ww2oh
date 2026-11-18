@@ -3,6 +3,7 @@
 #import "CallMonitor.h"
 #import "ManualControl.h"
 #import "FloatingBall.h"
+#import "DarwinMonitor.h"
 #import <AVFoundation/AVFoundation.h>
 #import <Speech/Speech.h>
 
@@ -15,6 +16,7 @@
 @property (nonatomic, strong) UISwitch  *autoSwitch;
 @property (nonatomic, strong) UIButton   *notifyBtn;      // 启用通知栏手动控制
 @property (nonatomic, strong) UISwitch  *floatSwitch;     // 悬浮球开关
+@property (nonatomic, strong) UISwitch  *wxSwitch;        // 微信通话自动录音开关
 @property (nonatomic, strong) UILabel    *statusLabel;
 @property (nonatomic, strong) UILabel    *levelLabel;
 @property (nonatomic, strong) UITableView *tableView;
@@ -63,9 +65,23 @@
 #pragma mark - 导航栏
 
 - (void)setupNavBar {
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"日志" style:UIBarButtonItemStylePlain
-                                       target:self action:@selector(shareDebugLog)];
+    UIBarButtonItem *wxLog = [[UIBarButtonItem alloc] initWithTitle:@"微信日志"
+                                                             style:UIBarButtonItemStylePlain
+                                                            target:self action:@selector(shareWeChatLog)];
+    UIBarButtonItem *recLog = [[UIBarButtonItem alloc] initWithTitle:@"录音日志"
+                                                              style:UIBarButtonItemStylePlain
+                                                             target:self action:@selector(shareDebugLog)];
+    self.navigationItem.rightBarButtonItems = @[ recLog, wxLog ];
+}
+- (void)shareWeChatLog {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSURL *url = [NSURL fileURLWithPath:[docs stringByAppendingPathComponent:@"wechat_auto.log"]];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
+        [self alert:@"还没有微信日志。注入 hook 后打一通微信电话，再回来看这个日志。" title:@"微信自动录音日志"]; return;
+    }
+    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    av.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
+    [self presentViewController:av animated:YES completion:nil];
 }
 - (void)shareDebugLog {
     NSURL *url = [[RecorderEngine shared] debugLogURL];
@@ -126,6 +142,18 @@
     [floatSw addTarget:self action:@selector(toggleFloatBall:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:floatSw]; self.floatSwitch = floatSw;
 
+    // 微信通话自动录音（需先注入 WeChatCallHook.dylib 到微信）
+    UILabel *wxLbl = [[UILabel alloc] init];
+    wxLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    wxLbl.text = @"③ 微信通话自动录音（需注入hook）";
+    wxLbl.font = [UIFont systemFontOfSize:13];
+    [self.view addSubview:wxLbl];
+    UISwitch *wxSw = [[UISwitch alloc] init];
+    wxSw.translatesAutoresizingMaskIntoConstraints = NO;
+    wxSw.on = [DarwinMonitor shared].wechatAutoEnabled;
+    [wxSw addTarget:self action:@selector(toggleWeChatAuto:) forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:wxSw]; self.wxSwitch = wxSw;
+
     UILabel *status = [[UILabel alloc] init];
     status.translatesAutoresizingMaskIntoConstraints = NO;
     status.text = @"准备就绪";
@@ -185,7 +213,11 @@
         [floatLbl.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
         [floatSw.topAnchor constraintEqualToAnchor:notifyBtn.bottomAnchor constant:8],
         [floatSw.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
-        [status.topAnchor constraintEqualToAnchor:floatLbl.bottomAnchor constant:12],
+        [wxLbl.topAnchor constraintEqualToAnchor:floatLbl.bottomAnchor constant:12],
+        [wxLbl.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20],
+        [wxSw.topAnchor constraintEqualToAnchor:floatLbl.bottomAnchor constant:8],
+        [wxSw.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20],
+        [status.topAnchor constraintEqualToAnchor:wxLbl.bottomAnchor constant:12],
         [status.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
         [status.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
         [level.topAnchor constraintEqualToAnchor:status.bottomAnchor constant:4],
@@ -217,6 +249,15 @@
     [[ManualControl shared] requestPermissionAndEnable];
     [self alert:@"已向通知中心投递『手动通话录音助手』。\n\n用法：微信/QQ 来电接通后，下拉通知中心，点通知上的『开始/停止录音』按钮即可，无需切回本 App。录音完成会再推一条结果通知。\n\n注：如果通知没出现，去 设置-通知 里允许本 App 通知。"
           title:@"微信/QQ 手动录音助手"];
+}
+
+// 微信通话自动录音开关（依赖 WeChatCallHook.dylib 已注入微信）
+- (void)toggleWeChatAuto:(UISwitch *)sw {
+    [DarwinMonitor shared].wechatAutoEnabled = sw.on;
+    [self alert:sw.on
+        ? @"已开启：微信来电接通后自动双路录音，挂断自动保存。\n\n前提：必须用 TrollFools 把 WeChatCallHook.dylib 注入微信（见说明文档）。没注入则不会触发。"
+        : @"已关闭微信通话自动录音。"
+          title:@"微信自动录音"];
 }
 
 // 悬浮球开关（TrollStore 权限下可浮在微信/QQ 之上）
