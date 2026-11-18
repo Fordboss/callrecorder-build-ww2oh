@@ -178,11 +178,14 @@ static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, NSStri
 @interface RecorderEngine () {
     CaptureChannel *_mic;
     CaptureChannel *_spk;
+    CaptureChannel *_monMic;     // 监测通道（只算电平，不写盘）
+    CaptureChannel *_monSpk;
     NSURL *_outURL;
     NSURL *_micURL;
     NSURL *_spkURL;
     TRChannel _channel;
     BOOL _recording;
+    BOOL _monitoring;
 }
 @end
 
@@ -235,10 +238,13 @@ static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef bu
     if (numPackets == 0 && ch->format.mBytesPerPacket != 0)
         numPackets = buffer->mAudioDataByteSize / ch->format.mBytesPerPacket;
 
-    OSStatus st = AudioFileWritePackets(ch->audioFile, false, buffer->mAudioDataByteSize,
-                                        packetDesc, ch->currentPacket, &numPackets, buffer->mAudioData);
-    if (st == noErr) ch->currentPacket += numPackets;
-    else if (ch->callbacks <= 3) CRLog(@"写盘失败 pid=%d st=%d", ch->pid, (int)st);
+    // audioFile==0 表示监测模式：只算电平不写盘
+    if (ch->audioFile) {
+        OSStatus st = AudioFileWritePackets(ch->audioFile, false, buffer->mAudioDataByteSize,
+                                            packetDesc, ch->currentPacket, &numPackets, buffer->mAudioData);
+        if (st == noErr) ch->currentPacket += numPackets;
+        else if (ch->callbacks <= 3) CRLog(@"写盘失败 pid=%d st=%d", ch->pid, (int)st);
+    }
 
     Float32 *s = (Float32 *)buffer->mAudioData;
     UInt32 count = buffer->mAudioDataByteSize / sizeof(Float32);
@@ -308,9 +314,14 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
         AudioQueueEnqueueBuffer(ch->queue, ch->buffers[i], 0, NULL);
     }
 
-    st = AudioFileCreateWithURL((__bridge CFURLRef)url, kAudioFileCAFType, &ch->format,
-                                kAudioFileFlags_EraseFile, &ch->audioFile);
-    if (st != noErr) { CRLog(@"★CAF创建失败 pid=%d st=%d", pid, (int)st); return nil; }
+    // url==nil → 监测模式：不创建文件，回调只更新电平
+    if (url) {
+        st = AudioFileCreateWithURL((__bridge CFURLRef)url, kAudioFileCAFType, &ch->format,
+                                    kAudioFileFlags_EraseFile, &ch->audioFile);
+        if (st != noErr) { CRLog(@"★CAF创建失败 pid=%d st=%d", pid, (int)st); return nil; }
+    } else {
+        ch->audioFile = 0;
+    }
     ch->currentPacket = 0;
 
     AudioQueueAddPropertyListener(ch->queue, kAudioQueueProperty_IsRunning, ListenerCallback, (__bridge void *)ch);
@@ -323,7 +334,9 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
 
 - (BOOL)startWithChannel:(TRChannel)channel fileURL:(NSURL *)fileURL error:(NSError **)error {
     if (_recording) return YES;
-    CRLog(@"========== 开始录音 v5 (双路混音) iOS=%@ ==========", [UIDevice currentDevice].systemVersion);
+    // 录音前先停监测，避免同 PID 两路 tap 冲突
+    if (_monitoring) [self stopMonitoring];
+    CRLog(@"========== 开始录音 v6 (双路混音+电平触发) iOS=%@ ==========", [UIDevice currentDevice].systemVersion);
     _channel = channel;
     _outURL = fileURL;
 
@@ -402,6 +415,45 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     _mic = nil; _spk = nil; _recording = NO;
 }
 
-- (void)dealloc { [self cleanup]; }
+#pragma mark - 监测模式（电平触发，不写盘）
+
+- (BOOL)startMonitoringWithError:(NSError **)error {
+    if (_monitoring) return YES;
+    if (_recording) { if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:-2 userInfo:@{NSLocalizedDescriptionKey:@"录音中不能同时监测"}]; return NO; }
+    CRLog(@"===== 启动音频监测 (电平触发) iOS=%@ =====", [UIDevice currentDevice].systemVersion);
+    NSError *e1 = nil, *e2 = nil;
+    // 麦克风(自己) + 扬声器(对方)，url=nil → 不写盘
+    _monMic = [self startChannelWithPID:kATAudioTapDescriptionPIDMicrophone channels:1 fileURL:nil error:&e1];
+    _monSpk = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker     channels:2 fileURL:nil error:&e2];
+    CRLog(@"监测通道 mic=%@ spk=%@ err1=%@ err2=%@", _monMic?@"OK":@"FAIL", _monSpk?@"OK":@"FAIL", e1.localizedDescription, e2.localizedDescription);
+    if (!_monMic && !_monSpk) {
+        if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:-3 userInfo:@{NSLocalizedDescriptionKey:@"两个监测通道都创建失败"}];
+        return NO;
+    }
+    _monitoring = YES;
+    return YES;
+}
+
+- (void)stopMonitoring {
+    if (!_monitoring) return;
+    [self stopChannel:_monMic]; [self stopChannel:_monSpk];
+    _monMic = nil; _monSpk = nil; _monitoring = NO;
+    CRLog(@"监测已停止");
+}
+
+- (BOOL)isMonitoring { return _monitoring; }
+- (float)monitorMicLevel { return _monMic ? _monMic->peak : 0; }
+- (float)monitorSpeakerLevel { return _monSpk ? _monSpk->peak : 0; }
+
+- (void)consumeMonitorLevelsMic:(float *)mic speaker:(float *)spk {
+    float m = _monMic ? _monMic->peak : 0;
+    float s = _monSpk ? _monSpk->peak : 0;
+    if (_monMic) _monMic->peak = 0;
+    if (_monSpk) _monSpk->peak = 0;
+    if (mic) *mic = m;
+    if (spk) *spk = s;
+}
+
+- (void)dealloc { [self cleanup]; [self stopMonitoring]; }
 
 @end
