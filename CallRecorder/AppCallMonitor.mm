@@ -1,49 +1,31 @@
 #import "AppCallMonitor.h"
 #import "RecorderEngine.h"
-#import <AVFoundation/AVAudioSession.h>
 #import <UIKit/UIKit.h>
-#import <dlfcn.h>
-#import <sys/sysctl.h>
 #import <math.h>
 
 // ============================================================
-// 微信/QQ 通话自动触发 —— 官方 TrollRecorder 同款多路信号探测版
-// 不注入、不脱壳。三层信号，任一命中即触发；每层都有详细日志。
-//   A) AVSystemController NowPlaying App 变化（微信通话会变 NowPlaying）
-//   B) MediaRemote NowPlaying 通知（dlsym 官方同款私有函数）
-//   C) sysctl 枚举进程 + proc_pidpath 判断微信/QQ 是否在运行
-//   D) 前台 App（BKS / accessibility，尽力而为，读不到不致命）
-// 微信/QQ bundle 与进程名双重识别；命中后调 RecorderEngine 双路录音。
-// 所有私有 API 动态调用 + @try 防护，拿不到就降级，绝不崩溃。
+// 持续录音模式 v1（对标官方免费版"后台常驻录音"）
+// ------------------------------------------------------------
+// 设计原则（这次不再做通话检测，因为检测信号在用户设备全部失效）：
+//   1. 启动即全程双路录音（麦克风 -3 + 扬声器 -2），微信/QQ/电话通话声音都录进去。
+//   2. 定时切段（默认5分钟一个文件），只保留最近 N 段，避免无限占空间。
+//   3. 每段记录 mic/spk 电平峰值到日志——用户打完电话一看就知道哪段有声音、录没录到。
+//   4. ★不激活 AVAudioSession★：官方 call-recorder.mm 和用户 v5 手动录音
+//      （已验证能录到微信通话）都是纯净 tap，靠 CanRecordWithoutSessionActivation 权限。
+//      v8.1 曾激活 mode:Default session，极可能破坏 tap 导致电平全 0。这次彻底去掉。
+// 不注入、不脱壳、不依赖任何会失效的通知/前台/MediaRemote API。
 // ============================================================
 
 static NSString * const kThirdPartyAutoKey = @"CallRecorderThirdPartyAuto";
 static NSString * const kLogName = @"appcall_monitor.log";
-
-static NSDictionary<NSString *, NSString *> *CallApps(void) {
-    return @{
-        @"com.tencent.xin":        @"微信",
-        @"com.tencent.mobileqq":   @"QQ",
-        @"com.tencent.mobileqqhd": @"QQHD",
-        @"com.tencent.wework":     @"企业微信",
-    };
-}
-// 进程名（proc_pidpath 末段）→ bundle
-static NSString *BundleFromProcName(NSString *proc) {
-    NSString *p = [proc lowercaseString];
-    if ([p containsString:@"wechat"]) return @"com.tencent.xin";
-    if ([p containsString:@"mobileqq"] || [p isEqualToString:@"qq"]) return @"com.tencent.mobileqq";
-    return nil;
-}
+static const NSTimeInterval kSegmentSeconds = 300.0;   // 每段5分钟
+static const NSInteger kKeepSegments = 24;             // 只保留最近24段(约2小时)
 
 @interface AppCallMonitor ()
-@property (nonatomic, strong) NSTimer *pollTimer;
-@property (nonatomic, copy)   NSString *currentCallApp;
-@property (nonatomic, assign) BOOL inCall;
-@property (nonatomic, assign) NSInteger hitCount;
-@property (nonatomic, assign) NSInteger audioHitTicks;   // 电平命中连续次数
-@property (nonatomic, assign) NSInteger audioSilentTicks;
-@property (nonatomic, assign) NSInteger diagTick;        // 诊断计数
+@property (nonatomic, strong) NSTimer *segmentTimer;
+@property (nonatomic, strong) NSTimer *diagTimer;
+@property (nonatomic, assign) NSInteger segmentIndex;
+@property (nonatomic, assign) NSInteger diagTick;
 @end
 
 @implementation AppCallMonitor
@@ -54,7 +36,8 @@ static NSString *BundleFromProcName(NSString *proc) {
     dispatch_once(&once, ^{
         s = [[self alloc] init];
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        s.thirdPartyAutoEnabled = [ud objectForKey:kThirdPartyAutoKey] ? [ud boolForKey:kThirdPartyAutoKey] : YES;
+        // 直接设 ivar，不触发开关副作用（开关副作用只在用户手动切换/start 时发生）
+        s->_thirdPartyAutoEnabled = [ud objectForKey:kThirdPartyAutoKey] ? [ud boolForKey:kThirdPartyAutoKey] : YES;
     });
     return s;
 }
@@ -63,6 +46,8 @@ static NSString *BundleFromProcName(NSString *proc) {
     _thirdPartyAutoEnabled = on;
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:kThirdPartyAutoKey];
     [self log:@"自动开关设为 %@", on ? @"开" : @"关"];
+    if (on) [self startContinuousRecording];
+    else [self stopContinuousRecording];
 }
 
 #pragma mark - 日志
@@ -84,7 +69,7 @@ static NSString *BundleFromProcName(NSString *proc) {
 }
 - (NSString *)recentLog:(NSUInteger)maxLines {
     NSString *txt = [NSString stringWithContentsOfURL:self.logURL encoding:NSUTF8StringEncoding error:nil];
-    if (!txt) return @"(暂无日志，先打一通微信/QQ电话)";
+    if (!txt) return @"(暂无日志)";
     NSArray *lines = [txt componentsSeparatedByString:@"\n"];
     NSUInteger from = lines.count > maxLines ? lines.count - maxLines : 0;
     return [[lines subarrayWithRange:NSMakeRange(from, lines.count - from)] componentsJoinedByString:@"\n"];
@@ -93,315 +78,140 @@ static NSString *BundleFromProcName(NSString *proc) {
 #pragma mark - 启动
 
 - (void)start {
-    [self log:@"===== AppCallMonitor v2 启动 (多路信号) ====="];
-
-    // A) AVSystemController NowPlaying App 变化（官方 TRApp 用这套）
-    [[NSNotificationCenter defaultCenter] addObserver:self
-        selector:@selector(onNowPlayingAppChange:)
-        name:@"AVSystemController_NowPlayingAppDidChangeNotification" object:nil];
-    [[NSNotificationCenter defaultCenter] addObserver:self
-        selector:@selector(onNowPlayingAppChange:)
-        name:@"AVSystemController_NowPlayingAppIsPlayingDidChangeNotification" object:nil];
-    [self log:@"[A] 已监听 AVSystemController NowPlaying 通知"];
-
-    // B) MediaRemote 通知（dlsym 官方同款）
-    [self setupMediaRemote];
-
-    // C) 音频会话中断（辅助）
-    [[NSNotificationCenter defaultCenter] addObserver:self
-        selector:@selector(onAudioInterruption:)
-        name:AVAudioSessionInterruptionNotification object:nil];
-    [self log:@"[C] 已监听 AVAudioSessionInterruptionNotification"];
-
-    // D) 激活音频会话（后台保活 + 收中断；MixWithOthers 不干扰微信）
-    @try {
-        AVAudioSession *ses = [AVAudioSession sharedInstance];
-        [ses setCategory:AVAudioSessionCategoryPlayAndRecord
-                    mode:AVAudioSessionModeDefault
-                 options:AVAudioSessionCategoryOptionMixWithOthers
-                   error:nil];
-        [ses setActive:YES error:nil];
-        [self log:@"[D] 音频会话激活: category=%@ mode=%@", ses.category, ses.mode];
-    } @catch (NSException *e) { [self log:@"[D] 音频会话异常: %@", e.reason]; }
-
-    // 启动常驻电平监测（核心：不依赖任何通知，有声音就检测得到）
-    NSError *merr = nil;
-    BOOL monOK = [[RecorderEngine shared] startMonitoringWithError:&merr];
-    [self log:@"[E] 电平监测启动 %@ %@", monOK ? @"成功" : @"失败", merr.localizedDescription ?: @""];
-
-    // 轮询（0.25s）—— 电平 + 信号综合判定
-    self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:0.25
-                       target:self selector:@selector(poll:) userInfo:nil repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:self.pollTimer forMode:NSRunLoopCommonModes];
-
+    [self log:@"===== 持续录音模式 v1 启动 ====="];
+    [self log:@"原理: 不做通话检测, App保持运行即全程双路录音, 每%.0f分钟自动存一个文件", kSegmentSeconds/60];
+    [self log:@"注意: 不激活AVAudioSession(对齐官方call-recorder/已验证的v5纯净tap路径)"];
+    if (self.thirdPartyAutoEnabled) {
+        [self startContinuousRecording];
+    } else {
+        [self log:@"自动开关关闭, 未启动录音"];
+    }
     [[NSNotificationCenter defaultCenter] addObserver:self
         selector:@selector(onAppActive:) name:UIApplicationDidBecomeActiveNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+        selector:@selector(onAppBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
 
-    [self log:@"[C] 初始进程探测: %@", [self runningCallAppsDescription]];
+    // 实时诊断：每5秒记录当前录音电平，打完电话回来看最后几行就知道录没录到
+    self.diagTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
+                      target:self selector:@selector(diagTick:) userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.diagTimer forMode:NSRunLoopCommonModes];
 }
 
-#pragma mark - B) MediaRemote
-
-- (void)setupMediaRemote {
-    @try {
-        void *h = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
-        if (!h) { [self log:@"[B] MediaRemote dlopen 失败: %s", dlerror()]; return; }
-        [self log:@"[B] MediaRemote dlopen 成功"];
-
-        void (*setWants)(BOOL) = (void (*)(BOOL))dlsym(h, "MRMediaRemoteSetWantsNowPlayingNotifications");
-        if (setWants) { setWants(YES); [self log:@"[B] SetWantsNowPlayingNotifications(YES) OK"]; }
-        else [self log:@"[B] 找不到 MRMediaRemoteSetWantsNowPlayingNotifications"];
-
-        CFStringRef *npRef = (CFStringRef *)dlsym(h, "kMRMediaRemoteNowPlayingApplicationDidChangeNotification");
-        NSString *npName = npRef && *npRef ? (__bridge NSString *)(*npRef) : @"kMRMediaRemoteNowPlayingApplicationDidChangeNotification";
-        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onNowPlayingAppChange:) name:npName object:nil];
-        [self log:@"[B] 已监听 MediaRemote NowPlaying 通知: %@", npName];
-    } @catch (NSException *e) { [self log:@"[B] MediaRemote 异常: %@", e.reason]; }
+- (void)diagTick:(NSTimer *)t {
+    if (![[RecorderEngine shared] isRecording]) {
+        [self log:@"[实时] 未录音"];
+        return;
+    }
+    float mic = [RecorderEngine shared].micLevel;
+    float spk = [RecorderEngine shared].speakerLevel;
+    [self log:@"[实时] mic=%.4f spk=%.4f %@", mic, spk,
+          fmaxf(mic,spk) > 0.01 ? @"★有声音" : @"(静音)"];
 }
-
-#pragma mark - 信号回调
 
 - (void)onAppActive:(NSNotification *)n {
-    [self log:@"App 回到前台 | 进程探测: %@", [self runningCallAppsDescription]];
+    [self log:@"App回到前台 | 录音中=%@ 当前第%ld段",
+          [[RecorderEngine shared] isRecording]?@"Y":@"N", (long)self.segmentIndex];
+}
+- (void)onAppBackground:(NSNotification *)n {
+    [self log:@"App进入后台 | 录音中=%@ (双路tap持续, 请勿强制杀后台)",
+          [[RecorderEngine shared] isRecording]?@"Y":@"N"];
 }
 
-- (void)onNowPlayingAppChange:(NSNotification *)n {
-    NSString *bundle = nil;
-    NSDictionary *ui = n.userInfo;
-    if (ui) {
-        for (NSString *key in ui) {
-            id v = ui[key];
-            NSString *s = [v isKindOfClass:[NSString class]] ? v : [v description];
-            if ([s containsString:@"tencent"]) { bundle = s; break; }
-        }
-        [self log:@"[A/B] NowPlaying通知 %@ userInfo=%@", n.name, ui];
-    } else {
-        [self log:@"[A/B] NowPlaying通知 %@ (无userInfo)", n.name];
+#pragma mark - 持续录音控制
+
+- (void)startContinuousRecording {
+    if ([[RecorderEngine shared] isRecording]) {
+        [self log:@"已在录音, 忽略重复启动"];
+        return;
     }
-    if ([self isCallApp:bundle]) {
-        [self log:@"[A/B] ★NowPlaying 命中通话App %@(%@)", bundle, CallApps()[bundle]];
-        [self maybeStartForApp:bundle];
-    } else {
-        NSString *fromProc = [self runningCallApp];
-        if (fromProc) { [self log:@"[A/B] NowPlaying变化 + 进程命中 %@ → 触发", fromProc]; [self maybeStartForApp:fromProc]; }
-    }
-}
-
-- (void)onAudioInterruption:(NSNotification *)n {
-    NSNumber *typeNum = n.userInfo[AVAudioSessionInterruptionTypeKey];
-    AVAudioSessionInterruptionType type = (AVAudioSessionInterruptionType)typeNum.unsignedIntegerValue;
-    NSUInteger opts = [n.userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
-    [self log:@"[C] 音频中断 type=%@ opts=%lu | 进程:%@",
-          type == AVAudioSessionInterruptionTypeBegan ? @"BEGAN" : @"ENDED",
-          (unsigned long)opts, [self runningCallAppsDescription]];
-    if (type == AVAudioSessionInterruptionTypeBegan) {
-        NSString *app = [self runningCallApp] ?: [self frontmostCallApp];
-        if (app) { [self log:@"[C] ★中断+命中 %@ → 触发", app]; [self maybeStartForApp:app]; }
-        else [self log:@"[C] 中断来了但没识别到微信/QQ进程，仅记录"];
-    }
-}
-
-#pragma mark - C) 进程探测（核心）
-
-- (NSArray<NSString *> *)runningWeChatQQProcNames {
-    NSMutableArray *out = [NSMutableArray array];
-    @try {
-        size_t size = 0;
-        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-        if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0) return out;
-        struct kinfo_proc *procs = (struct kinfo_proc *)malloc(size);
-        if (!procs) return out;
-        if (sysctl(mib, 4, procs, &size, NULL, 0) == 0) {
-            int n = (int)(size / sizeof(struct kinfo_proc));
-            for (int i = 0; i < n; i++) {
-                // iOS 上用 kp_proc.p_comm 拿进程名（最多16字符，如 WeChat / MobileQQ）
-                char *comm = procs[i].kp_proc.p_comm;
-                if (comm[0]) {
-                    NSString *pname = [NSString stringWithUTF8String:comm];
-                    if (BundleFromProcName(pname) && ![out containsObject:pname]) [out addObject:pname];
-                }
-            }
-        }
-        free(procs);
-    } @catch (NSException *e) { [self log:@"[C] 进程探测异常: %@", e.reason]; }
-    return out;
-}
-
-- (NSString *)runningCallApp {
-    for (NSString *proc in [self runningWeChatQQProcNames]) {
-        NSString *b = BundleFromProcName(proc);
-        if (b) return b;
-    }
-    return nil;
-}
-
-- (NSString *)runningCallAppsDescription {
-    NSArray *a = [self runningWeChatQQProcNames];
-    return a.count ? [a componentsJoinedByString:@","] : @"(无微信/QQ进程)";
-}
-
-#pragma mark - D) 前台读取（尽力而为，读不到不致命）
-
-- (NSString *)frontmostCallApp {
-    NSString *b = [self frontmostViaBKS];
-    if ([self isCallApp:b]) return b;
-    b = [self frontmostViaAccessibility];
-    if ([self isCallApp:b]) return b;
-    return nil;
-}
-
-- (NSString *)frontmostViaAccessibility {
-    @try {
-        UIApplication *app = [UIApplication sharedApplication];
-        SEL sel = NSSelectorFromString(@"_accessibilityFrontMostApplication");
-        if (![app respondsToSelector:sel]) return nil;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        id front = [app performSelector:sel];
-#pragma clang diagnostic pop
-        if ([front respondsToSelector:@selector(bundleIdentifier)])
-            return [front performSelector:@selector(bundleIdentifier)];
-    } @catch (NSException *e) {}
-    return nil;
-}
-
-- (NSString *)frontmostViaBKS {
-    @try {
-        Class BKSClass = NSClassFromString(@"BKSApplicationStateMonitor");
-        if (!BKSClass) return nil;
-        id monitor = [[BKSClass alloc] init];
-        SEL stateSel = NSSelectorFromString(@"applicationStateForBundleIdentifier:");
-        for (NSString *bundle in CallApps()) {
-            if ([monitor respondsToSelector:stateSel]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                id st = [monitor performSelector:stateSel withObject:bundle];
-#pragma clang diagnostic pop
-                // BKSApplicationStateFrontmost = 4
-                if ([st isKindOfClass:[NSNumber class]] && [st unsignedIntegerValue] == 4) return bundle;
-            }
-        }
-    } @catch (NSException *e) {}
-    return nil;
-}
-
-#pragma mark - 轮询
-
-// 电平阈值：Float32 PCM，语音通常峰值 0.02~0.3；0.01 过滤底噪
-static const float kLevelThreshold = 0.012f;
-
-- (void)poll:(NSTimer *)t {
-    self.diagTick++;
-
-    // 1) 读监测电平（并清零）。录音进行中读的是录音通道电平。
-    float mic = 0, spk = 0;
-    if ([[RecorderEngine shared] isMonitoring]) {
-        [[RecorderEngine shared] consumeMonitorLevelsMic:&mic speaker:&spk];
-    } else if ([[RecorderEngine shared] isRecording]) {
-        mic = [RecorderEngine shared].micLevel;
-        spk = [RecorderEngine shared].speakerLevel;
-    }
-    float peak = fmaxf(mic, spk);
-    BOOL hasSound = peak > kLevelThreshold;
-
-    // 2) 每 5 秒打一次诊断（把电平打出来，能直接看出微信通话时有没有声音进来）
-    if (self.diagTick % 20 == 0) {
-        [self log:@"[诊断] mic=%.4f spk=%.4f 有声=%@ | 进程:%@ | 录音中=%@",
-              mic, spk, hasSound?@"Y":@"N", [self runningCallAppsDescription],
-              [[RecorderEngine shared] isRecording]?@"Y":@"N"];
-    }
-
-    // 3) 未在录音：电平触发
-    if (![[RecorderEngine shared] isRecording]) {
-        // 音频活动命中时，优先确认微信/QQ进程在（降低误触发）；进程读不到就用纯电平
-        NSString *procApp = [self runningCallApp];
-        if (hasSound) {
-            self.audioHitTicks++;
-            self.audioSilentTicks = 0;
-            // 连续 6 次(1.5s)有声音 → 判定通话
-            if (self.audioHitTicks >= 6) {
-                NSString *app = procApp ?: @"微信";  // 读不到进程名就先默认按微信触发
-                [self log:@"[E] ★电平触发(连续%ld次有声音, mic=%.3f spk=%.3f) app=%@",
-                      (long)self.audioHitTicks, mic, spk, app];
-                self.audioHitTicks = 0;
-                [self triggerRecordForApp:app];
-            }
-        } else {
-            self.audioSilentTicks++;
-            if (self.audioSilentTicks > 8) self.audioHitTicks = 0;  // 静音2s清零累计
-        }
-    }
-    // 4) 录音中：检测挂断（持续静音 ~6s）
-    else if (self.inCall) {
-        if (hasSound) {
-            self.audioSilentTicks = 0;
-        } else {
-            self.audioSilentTicks++;
-            if (self.audioSilentTicks >= 24) {  // 6s 静音 → 挂断
-                [self log:@"[E] 录音中持续静音6s → 判定挂断, 停止"];
-                self.audioSilentTicks = 0;
-                [self stopRecordAndResumeMonitor];
-            }
-        }
-    }
-}
-
-// 触发录音：先停监测，再开正式录音
-- (void)triggerRecordForApp:(NSString *)bundle {
-    if (!self.thirdPartyAutoEnabled) { [self log:@"自动开关关闭, 不启动"]; return; }
-    if ([[RecorderEngine shared] isRecording]) return;
-    [[RecorderEngine shared] stopMonitoring];
-    self.currentCallApp = bundle;
-    self.inCall = YES;
+    self.segmentIndex++;
 
     NSDateFormatter *fmt = [NSDateFormatter new]; fmt.dateFormat = @"yyyyMMdd_HHmmss";
-    NSString *label = CallApps()[bundle] ?: @"微信";
-    NSString *name = [NSString stringWithFormat:@"auto_%@_%@.m4a", label, [fmt stringFromDate:[NSDate date]]];
+    NSString *name = [NSString stringWithFormat:@"rec_%@.m4a", [fmt stringFromDate:[NSDate date]]];
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSURL *url = [NSURL fileURLWithPath:[docs stringByAppendingPathComponent:name]];
+
     NSError *err = nil;
     BOOL ok = [[RecorderEngine shared] startWithChannel:TRChannelSystemAudio fileURL:url error:&err];
-    [self log:@"→ 电平触发双路录音 %@: %@ %@", ok?@"成功":@"失败", name, err.localizedDescription ?: @""];
+    [self log:@"▶ 开始第%ld段 %@ : %@ %@", (long)self.segmentIndex, name,
+          ok?@"成功":@"失败", err.localizedDescription ?: @""];
+
+    // 定时切段（NSTimer 在后台可能被节流，最坏情况只是这段更长，不影响录到声音）
+    [self.segmentTimer invalidate];
+    self.segmentTimer = [NSTimer scheduledTimerWithTimeInterval:kSegmentSeconds
+                         target:self selector:@selector(rotateSegment) userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.segmentTimer forMode:NSRunLoopCommonModes];
+
     if (!ok) {
-        // 启动失败，恢复监测
-        NSError *merr = nil;
-        [[RecorderEngine shared] startMonitoringWithError:&merr];
-        self.inCall = NO;
+        // 启动失败：稍后重试一次
+        __weak typeof(self) wf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (wf.thirdPartyAutoEnabled && ![[RecorderEngine shared] isRecording]) [wf startContinuousRecording];
+        });
     }
 }
 
-- (void)stopRecordAndResumeMonitor {
-    self.inCall = NO;
-    if ([[RecorderEngine shared] isRecording]) {
-        [self log:@"→ 挂断, 停止并保存, 恢复监测"];
-        [[RecorderEngine shared] stop];
-    }
-    // 延迟恢复监测（等混音完成）
+- (void)rotateSegment {
+    if (![[RecorderEngine shared] isRecording]) return;
+
+    // 切段前读电平峰值并写入日志——这是判断"这段有没有录到通话"的关键证据
+    float mic = [RecorderEngine shared].micLevel;
+    float spk = [RecorderEngine shared].speakerLevel;
+    float peak = fmaxf(mic, spk);
+    [self log:@"⏱ 第%ld段结束 | 峰值 mic=%.4f spk=%.4f → %@",
+          (long)self.segmentIndex, mic, spk,
+          peak > 0.01 ? @"★有声音(可能含通话)" : @"(静音/底噪)"];
+
+    [[RecorderEngine shared] stop];   // 同步混音保存 m4a
+    [self cleanupOldSegments];
+
+    // 稍等混音收尾再开下一段
     __weak typeof(self) wf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if ([RecorderEngine shared].isRecording) return;
-        NSError *merr = nil;
-        BOOL ok = [[RecorderEngine shared] startMonitoringWithError:&merr];
-        [wf log:@"→ 监测恢复 %@ %@", ok?@"OK":@"FAIL", merr.localizedDescription ?: @""];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (wf.thirdPartyAutoEnabled && ![[RecorderEngine shared] isRecording]) [wf startContinuousRecording];
     });
 }
 
-- (void)confirmEndIfStillNotCall { [self stopRecordAndResumeMonitor]; }
-
-// 通知型信号（NowPlaying/中断）到来时的加速触发，统一走电平验证后的录音路径。
-// 注意：这些信号在部分设备不来，所以只是加速，主触发仍靠 poll 里的电平检测。
-- (void)maybeStartForApp:(NSString *)bundle {
-    [self log:@"[信号] 收到通知型触发 %@（若设备收不到属正常，靠电平兜底）", bundle];
-    // 不立即录音，交给 poll 的电平检测确认真的有声音，避免误触发
+- (void)stopContinuousRecording {
+    [self.segmentTimer invalidate]; self.segmentTimer = nil;
+    if ([[RecorderEngine shared] isRecording]) {
+        float mic = [RecorderEngine shared].micLevel;
+        float spk = [RecorderEngine shared].speakerLevel;
+        [self log:@"⏹ 停止录音 | 峰值 mic=%.4f spk=%.4f → %@",
+              mic, spk, fmaxf(mic,spk) > 0.01 ? @"★有声音" : @"(静音)"];
+        [[RecorderEngine shared] stop];
+    }
 }
 
-- (void)maybeStop { [self stopRecordAndResumeMonitor]; }
-
-- (BOOL)isCallApp:(NSString *)bundle { return bundle && CallApps()[bundle] != nil; }
+- (void)cleanupOldSegments {
+    @try {
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
+        NSMutableArray *recs = [NSMutableArray array];
+        for (NSString *f in files) {
+            if ([f hasPrefix:@"rec_"] && [f hasSuffix:@".m4a"]) {
+                NSString *full = [docs stringByAppendingPathComponent:f];
+                NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:full error:nil];
+                [recs addObject:@{@"path":full, @"date":attr[NSFileCreationDate] ?: [NSDate date]}];
+            }
+        }
+        if (recs.count > kKeepSegments) {
+            [recs sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                return [a[@"date"] compare:b[@"date"]];  // 旧->新
+            }];
+            for (NSInteger i = 0; i < recs.count - kKeepSegments; i++) {
+                [[NSFileManager defaultManager] removeItemAtPath:recs[i][@"path"] error:nil];
+            }
+            [self log:@"🧹 清理旧录音 %ld 个, 保留最近%ld段",
+                  (long)(recs.count - kKeepSegments), (long)kKeepSegments];
+        }
+    } @catch (NSException *e) { [self log:@"清理异常: %@", e.reason]; }
+}
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
-    [self.pollTimer invalidate];
+    [self.segmentTimer invalidate];
+    [self.diagTimer invalidate];
     [[RecorderEngine shared] stopMonitoring];
 }
 
