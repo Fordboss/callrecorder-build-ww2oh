@@ -154,7 +154,7 @@
     // 微信通话自动录音（需先注入 WeChatCallHook.dylib 到微信）
     UILabel *wxLbl = [[UILabel alloc] init];
     wxLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    wxLbl.text = @"③ 微信/QQ自动录音（v9.2 WAV直写·免注入）";
+    wxLbl.text = @"③ 微信/QQ自动录音（v9.3 队列修复·免注入）";
     wxLbl.font = [UIFont systemFontOfSize:13];
     [self.view addSubview:wxLbl];
     UISwitch *wxSw = [[UISwitch alloc] init];
@@ -264,9 +264,9 @@
 - (void)toggleWeChatAuto:(UISwitch *)sw {
     [AppCallMonitor shared].thirdPartyAutoEnabled = sw.on;
     [self alert:sw.on
-        ? @"已开启【v9.2 自动录音】：装上即用，无需注入、无需脱壳。\n\n★两处关键修复：\n① 出文件改为采集回调里 Float32→Int16 直接写标准 PCM WAV，彻底不经过 AAC 编码器 / ExtAudioFile / CAF 二次读盘 / 混音；保底 WAV 永不覆盖，另存一份 _双方.wav 立体声。\n② 播放前激活 AVAudioSession(Playback)，修掉 v9 起「为 tap 不激活会话」导致静音键把文件声音吞掉的问题 —— 不用重录，现在直接点列表里旧文件也能听。\n\n每2分钟一段、只留最近20段，默认 11.025kHz 省空间。长按文件选『文件体检』，会直接告诉你文件里到底有没有声音数据。"
+        ? @"已开启【v9.3 自动录音】：装上即用，无需注入、无需脱壳。\n\n★真机日志定位到的根因：采集回调里原来用 `running` 决定是否把 buffer 重新入队，但 `running` 在 AudioQueueStart 之后才置位，前 3 个预分配 buffer 用完队列就永久饿死（日志 mic回调=3、采样字节=0）。本版改为只有显式停止才停止入队。\n\n★另外：「单点开始录音」改走标准麦克风队列（不依赖私有 tap），激活 AVAudioSession 后直接写 WAV，一定能出可播放文件。\n\n自动模式仍是三路 tap + WAV 直写，新增 [回调] 日志显示队列是否在跑、buffer 是否有字节。长按文件可选『文件体检』看峰值。"
         : @"已关闭自动录音，已停止并保存当前段。"
-          title:@"v9.2 自动录音"];
+          title:@"v9.3 自动录音"];
 }
 
 // 悬浮球开关（TrollStore 权限下可浮在微信/QQ 之上）
@@ -312,7 +312,7 @@
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateFormat = @"yyyyMMdd_HHmmss";
     NSString *prefix = autoTriggered ? @"auto_call" : @"call";
-    NSString *name = [NSString stringWithFormat:@"%@_%@.m4a", prefix, [fmt stringFromDate:[NSDate date]]];
+    NSString *name = [NSString stringWithFormat:@"%@_%@.wav", prefix, [fmt stringFromDate:[NSDate date]]];
     NSURL *url = [[self docsURL] URLByAppendingPathComponent:name];
 
     NSError *error = nil;

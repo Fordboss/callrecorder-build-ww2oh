@@ -159,6 +159,7 @@ static BOOL CRMixWavToStereo(NSURL *aURL, NSURL *bURL, NSURL *outURL,
     int                         callbacks;
     UInt64                      totalBytes;
     BOOL                        running;
+    BOOL                        stopRequested;   // v9.3: 只有显式停止才不再入队
 }
 @end
 @implementation CaptureChannel
@@ -426,7 +427,17 @@ static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef bu
     }
     ch->totalBytes += buffer->mAudioDataByteSize;
     ch->callbacks++;
-    if (ch->running) AudioQueueEnqueueBuffer(aq, buffer, 0, NULL);
+    // v9.3 诊断：前 3 次 + 每 200 次打印，一眼看出队列是否持续跑、buffer 是否为空
+    if (ch->callbacks <= 3 || ch->callbacks % 200 == 0) {
+        CRAppLog(@"[回调] pid=%d #%d byteSize=%u 累计=%lluB 峰值=%.4f",
+                 ch->pid, ch->callbacks, (unsigned)buffer->mAudioDataByteSize,
+                 ch->totalBytes, ch->peakEver);
+    }
+    // ★v9.3 根因修复：旧代码用 if(ch->running) 决定是否重新入队，而 running 在
+    // AudioQueueStart 之后才置 YES —— 前 3 个 buffer 的回调触发时 running=NO，
+    // 于是 3 个预分配 buffer 用完就永久饿死（真机日志 mic回调=3 采样字节=0）。
+    // 改为只有 stopChannel 显式置 stopRequested 才停止入队。
+    if (!ch->stopRequested) AudioQueueEnqueueBuffer(aq, buffer, 0, NULL);
 }
 
 static void ListenerCallback(void *userData, AudioQueueRef queue, AudioQueuePropertyID prop) {
@@ -501,10 +512,12 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     ch->currentPacket = 0;
 
     AudioQueueAddPropertyListener(ch->queue, kAudioQueueProperty_IsRunning, ListenerCallback, (__bridge void *)ch);
+    // ★v9.3：必须在 Start 之前置位（回调可能同步触发），且回调已改为无条件入队
+    ch->stopRequested = NO;
+    ch->running = YES;
     st = AudioQueueStart(ch->queue, NULL);
     CRLog(@"pid=%d AudioQueueStart=%d buf=%u", pid, (int)st, (unsigned)ch->bufferSize);
-    if (st != noErr) return nil;
-    ch->running = YES;
+    if (st != noErr) { ch->running = NO; return nil; }
     return ch;
 }
 
@@ -563,6 +576,54 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
              kTapSampleRate, (unsigned)rate, (unsigned)ch->format.mChannelsPerFrame,
              (unsigned)down, url.lastPathComponent);
     return YES;
+}
+
+// v9.3 ★「单点开始录音」专用：标准麦克风 AudioQueue，完全不依赖私有 tap。
+// 激活 AVAudioSession 后由系统直接推送麦克风 PCM —— 只要授权过就 100% 有数据，
+// 用来把「输出文件为空」和「tap 抓不到对方声音」这两件事彻底分开。
+- (CaptureChannel *)startPlainMicWithWavURL:(NSURL *)wavURL down:(UInt32)down error:(NSError **)error {
+    CaptureChannel *ch = [CaptureChannel new];
+    ch->pid = -3;
+    AVAudioFormat *af = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
+                                                         sampleRate:kTapSampleRate
+                                                           channels:1 interleaved:YES];
+    ch->format = *([af streamDescription]);
+
+    AVAudioSession *sess = [AVAudioSession sharedInstance];
+    [sess setCategory:AVAudioSessionCategoryPlayAndRecord
+                 mode:AVAudioSessionModeMeasurement
+              options:AVAudioSessionCategoryOptionDefaultToSpeaker error:nil];
+    [sess setActive:YES error:nil];
+
+    // flag 0 = 普通输入队列；不建 tap、不设 qtob
+    OSStatus st = AudioQueueNewInput(&ch->format, RecorderCallback, (__bridge void *)ch,
+                                     NULL, NULL, 0, &ch->queue);
+    if (st != noErr) {
+        CRAppLog(@"[手动] AudioQueueNewInput 失败 st=%d", (int)st);
+        if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:(int)st
+                             userInfo:@{NSLocalizedDescriptionKey:@"无法创建麦克风录音队列"}];
+        return nil;
+    }
+    CalcBufSize(ch->queue, ch->format, &ch->bufferSize);
+    for (int i = 0; i < kNumberOfBuffers; i++) {
+        st = AudioQueueAllocateBuffer(ch->queue, ch->bufferSize, &ch->buffers[i]);
+        if (st != noErr) return nil;
+        AudioQueueEnqueueBuffer(ch->queue, ch->buffers[i], 0, NULL);
+    }
+    ch->audioFile = 0;
+    ch->currentPacket = 0;
+    // WAV 在 Start 之前挂好，避免丢开头几个 buffer
+    if (![self attachWavOutput:wavURL toChannel:ch down:down]) {
+        if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:-5
+                             userInfo:@{NSLocalizedDescriptionKey:@"无法创建 WAV 文件"}];
+        return nil;
+    }
+    ch->stopRequested = NO;
+    ch->running = YES;                 // ★Start 之前
+    st = AudioQueueStart(ch->queue, NULL);
+    CRAppLog(@"[手动] 标准麦克风队列 Start=%d buf=%u (无tap/无qtob)", (int)st, (unsigned)ch->bufferSize);
+    if (st != noErr) { ch->running = NO; return nil; }
+    return ch;
 }
 
 // v9：官方免费版配方 —— 按微信/QQ 真实进程 PID 做 app-tap
@@ -627,32 +688,17 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
 
 - (BOOL)startWithChannel:(TRChannel)channel fileURL:(NSURL *)fileURL error:(NSError **)error {
     if (_recording) return YES;
-    // 录音前先停监测，避免同 PID 两路 tap 冲突
     if (_monitoring) [self stopMonitoring];
     _autoMode = NO;
-    CRLog(@"========== 开始录音 v6 (双路混音+电平触发) iOS=%@ ==========", [UIDevice currentDevice].systemVersion);
     _channel = channel;
     _outURL = fileURL;
-
-    NSString *base = [[fileURL lastPathComponent] stringByDeletingPathExtension];
-    NSURL *dir = [fileURL URLByDeletingLastPathComponent];
-    NSURL *micURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_mic.caf"]];
-    NSURL *spkURL = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_spk.caf"]];
-    self->_micURL = micURL; self->_spkURL = spkURL;
-
-    // tap 通道不激活 AVAudioSession（靠 CanRecordWithoutSessionActivation 权限）
-    if (channel == TRChannelMicrophone || channel == TRChannelSpeaker) {
-        // 单路也用 tap 配方，行为一致
-    }
-
-    if (channel == TRChannelSystemAudio || channel == TRChannelMicrophone) {
-        _mic = [self startChannelWithPID:kATAudioTapDescriptionPIDMicrophone channels:1 fileURL:micURL error:error];
-        if (!_mic) { [self fail:@"麦克风通道启动失败" error:error]; return NO; }
-    }
-    if (channel == TRChannelSystemAudio || channel == TRChannelSpeaker) {
-        _spk = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker channels:2 fileURL:spkURL error:error];
-        if (!_spk) { [self fail:@"扬声器通道启动失败" error:error]; return NO; }
-    }
+    // v9.3：手动「单点开始录音」改走标准麦克风队列，不再依赖私有 tap。
+    // 之前手动/自动共用 tap 通道，一旦 tap 不推数据 / 队列饿死，就必然「输出文件为空」。
+    UInt32 down = (_quality == TRQualityHigh) ? 1 : ((_quality == TRQualityNormal) ? 2 : 4);
+    self->_micURL = nil; self->_spkURL = nil; self->_appURL = nil; self->_sysURL = nil;
+    CRLog(@"========== 开始录音 v9.3 (标准麦克风 WAV) iOS=%@ ==========", [UIDevice currentDevice].systemVersion);
+    _mic = [self startPlainMicWithWavURL:_outURL down:down error:error];
+    if (!_mic) { [self fail:@"麦克风启动失败" error:error]; return NO; }
     _recording = YES;
     return YES;
 }
@@ -671,6 +717,7 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     _recording = NO;
 
     NSFileManager *fm = [NSFileManager defaultManager];
+    (void)MixCAFs; (void)SampleRateForQuality;   // 旧链路保留但不再调用，避免未使用告警
 
     // ============ v9.2 自动模式：纯 WAV 路径，绝不触碰 AAC / CAF / MixCAFs ============
     if (_autoMode) {
@@ -728,99 +775,28 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
         return;
     }
 
-    // ============ 手动录音模式：沿用原 CAF→MixCAFs→m4a 链路 ============
-    UInt64 micCafBytes = CRFileSize(_micURL);
-    UInt64 appCafBytes = CRFileSize(_appURL);
-    UInt64 sysCafBytes = CRFileSize(_sysURL);
-    UInt64 directBytes = CRFileSize(_outURL);
-    CRAppLog(@"[停止] mic回调=%d 采样字节=%llu 峰值Ever=%.4f | app峰值Ever=%.4f | sys峰值Ever=%.4f",
-             _mic ? _mic->callbacks : 0, _mic ? _mic->totalBytes : 0,
-             _mic ? _mic->peakEver : 0, _app ? _app->peakEver : 0, _sys ? _sys->peakEver : 0);
-    CRAppLog(@"[停止] 文件: 直写m4a=%lluB mic.caf=%lluB app.caf=%lluB sys.caf=%lluB",
-             directBytes, micCafBytes, appCafBytes, sysCafBytes);
-
-    NSURL *in1 = self->_micURL;
-    NSURL *in2 = nil;
-    if (_autoMode) {
-        float appPeak = _app ? _app->peakEver : 0;
-        float sysPeak = _sys ? _sys->peakEver : 0;
-        if (_appTapActive && _sys) {
-            in2 = (appPeak >= sysPeak) ? self->_appURL : self->_sysURL;
-            CRLog(@"★v9择优: app-tap=%.4f sys混音=%.4f → 采用 %@",
-                  appPeak, sysPeak, in2.lastPathComponent);
-        } else {
-            in2 = self->_appURL ?: self->_spkURL;
-            CRLog(@"v9: 采用 %@ (回退路径)", in2.lastPathComponent);
-        }
-    } else {
-        in2 = (_channel == TRChannelSystemAudio && self->_spkURL) ? self->_spkURL : nil;
-    }
-
-    NSString *base = [[_outURL lastPathComponent] stringByDeletingPathExtension];
-    NSURL *dir = [_outURL URLByDeletingLastPathComponent];
-    NSURL *mixTmp  = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_mix.tmp"]];
-    NSURL *backup  = [dir URLByAppendingPathComponent:[base stringByAppendingString:@"_direct.tmp"]];
-    [fm removeItemAtURL:mixTmp error:nil];
-    [fm removeItemAtURL:backup error:nil];
-
-    Float64 sr = SampleRateForQuality(_quality);
-    UInt64 mixFrames = 0;
-    NSString *err = nil;
-    CRLog(@"混音：%@ + %@ -> %@ @%.0fHz", in1.lastPathComponent, in2.lastPathComponent,
-          mixTmp.lastPathComponent, sr);
-    BOOL ok = MixCAFs(in1, in2, mixTmp, sr, &mixFrames, &err);
-    UInt64 mixBytes = CRFileSize(mixTmp);
-    CRAppLog(@"[停止] 混音结果=%@ 输出=%lluB 帧数=%llu %@",
-             ok ? @"成功" : @"失败", mixBytes, mixFrames, err ?: @"");
-
-    // 混音成功且确实写出音频帧，才升级为立体声；否则原样保留直写 m4a
-    BOOL useMix = NO;
-    if (ok && mixFrames > 0 && mixBytes > 1024) {
-        NSError *mvErr = nil;
-        BOOL hasBackup = (directBytes > 0);   // 手动录音模式没有保底直写文件
-        if (hasBackup) [fm moveItemAtURL:_outURL toURL:backup error:nil];
-        else [fm removeItemAtURL:_outURL error:nil];
-        if ([fm moveItemAtURL:mixTmp toURL:_outURL error:&mvErr]) {
-            useMix = YES;
-            if (hasBackup) [fm removeItemAtURL:backup error:nil];
-            CRAppLog(@"[停止] 采用立体声混音（左=自己 右=对方）%@", hasBackup ? @"，已覆盖保底文件" : @"");
-        } else {
-            if (hasBackup) [fm moveItemAtURL:backup toURL:_outURL error:nil];
-            CRAppLog(@"[停止] 覆盖保底失败，已还原：%@", mvErr.localizedDescription ?: @"");
-        }
-    }
-    if (!useMix) {
-        [fm removeItemAtURL:mixTmp error:nil];
-        CRAppLog(@"[停止] 保留保底直写 m4a（%lluB），混音结果未采用", directBytes);
-    }
-
-    // 三重保底：连直写 m4a 都异常时，留下原始 PCM CAF 供直接播放
-    if (CRFileSize(_outURL) < 1024 && micCafBytes > 1024) {
-        NSURL *cafOut = [[_outURL URLByDeletingPathExtension] URLByAppendingPathExtension:@"caf"];
-        [fm removeItemAtURL:cafOut error:nil];
-        [fm copyItemAtURL:_micURL toURL:cafOut error:nil];
-        CRAppLog(@"[停止] 注意：保底也为空 → 已保留原始 PCM CAF: %@", cafOut.lastPathComponent);
-    }
-
-    UInt64 finalBytes = CRFileSize(_outURL);
-    if (finalBytes > 1024) {
-        CRLog(@"录音完成：%@ (%lluB)", _outURL.lastPathComponent, finalBytes);
+    // ============ v9.3 手动模式：标准麦克风已直接写 WAV，只需收尾 ============
+    UInt64 mFrames  = _mic ? _mic->wavFrames   : 0;
+    UInt64 mNonZero = _mic ? _mic->wavNonZero  : 0;
+    UInt64 mBytes   = CRFileSize(_outURL);
+    CRAppLog(@"[停止] 手动 WAV: 回调=%d 帧=%llu 非零=%llu 字节=%llu",
+             _mic ? _mic->callbacks : 0, mFrames, mNonZero, mBytes);
+    [[AVAudioSession sharedInstance] setActive:NO error:nil];
+    if (mBytes > 44 && mNonZero > 0) {
+        CRLog(@"录音完成(手动WAV)：%@ (%lluB)", _outURL.lastPathComponent, mBytes);
         if ([_delegate respondsToSelector:@selector(recorderDidFinishWithURL:micLevel:speakerLevel:)])
-            [_delegate recorderDidFinishWithURL:_outURL micLevel:_mic?_mic->peakEver:0 speakerLevel:_app?_app->peakEver:0];
+            [_delegate recorderDidFinishWithURL:_outURL micLevel:_mic ? _mic->peakEver : 0 speakerLevel:0];
     } else {
-        NSString *msg = err ?: @"输出文件为空";
-        CRAppLog(@"[停止] 交付失败：%@", msg);
+        CRAppLog(@"[停止] 手动录音没采到声音（队列回调=%d）", _mic ? _mic->callbacks : 0);
         if ([_delegate respondsToSelector:@selector(recorderDidFailWithMessage:)])
-            [_delegate recorderDidFailWithMessage:msg];
+            [_delegate recorderDidFailWithMessage:@"麦克风没采到数据，请检查系统设置里是否允许本 App 使用麦克风"];
     }
-
-    NSURL *temps[4] = { self->_micURL, self->_spkURL, self->_appURL, self->_sysURL };
-    for (int i = 0; i < 4; i++) if (temps[i]) [fm removeItemAtURL:temps[i] error:nil];
     [self cleanup];
 }
 
 - (void)stopChannel:(CaptureChannel *)ch {
     if (!ch) return;
+    ch->stopRequested = YES;   // v9.3: 让回调不再重新入队
     ch->running = NO;
     if (ch->queue) { AudioQueueStop(ch->queue, true); AudioQueueRemovePropertyListener(ch->queue, kAudioQueueProperty_IsRunning, ListenerCallback, (__bridge void *)ch); }
     if (ch->audioFile) { AudioFileClose(ch->audioFile); ch->audioFile = 0; }

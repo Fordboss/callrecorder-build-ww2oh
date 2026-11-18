@@ -147,7 +147,8 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 #pragma mark - 启动
 
 - (void)start {
-    [self log:@"===== 持续录音 v9.2 (PCM WAV 直写) 启动 ====="];
+    [self log:@"===== 持续录音 v9.3 (队列入队修复 + PCM WAV) 启动 ====="];
+    [self log:@"★队列修复: 回调无条件重新入队, 只有 stopChannel 显式置位才停 (旧版3个buffer后饿死)"];
     [self log:@"★出文件: 回调里 Float32→Int16→fwrite 写标准 WAV, 不经AAC/ExtAudioFile/CAF/混音编码"];
     [self log:@"三路: 自己(-3) + 对方(真实PID) + 系统混音(-2), 停止时纯字节择优合成 _双方.wav"];
     [self log:@"保底 WAV 永不覆盖; 播放前会激活 AVAudioSession(避免静音键导致听不到)"];
