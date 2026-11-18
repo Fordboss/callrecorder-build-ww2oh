@@ -70,7 +70,7 @@
 #pragma mark - UI
 
 - (void)setupUI {
-    UISegmentedControl *picker = [[UISegmentedControl alloc] initWithItems:@[@"通话双方", @"麦克风", @"扬声器"]];
+    UISegmentedControl *picker = [[UISegmentedControl alloc] initWithItems:@[@"麦克风", @"扬声器/听筒"]];
     picker.translatesAutoresizingMaskIntoConstraints = NO;
     picker.selectedSegmentIndex = 0;
     [self.view addSubview:picker];
@@ -184,17 +184,19 @@
         self.recordButton.backgroundColor = [UIColor systemRedColor];
         float level = engine.peakLevel;
         self.statusLabel.text = level < 0.001f
-            ? @"已保存 · ⚠️全程静音，试试『麦克风』通道说话"
+            ? @"已保存 · ⚠️全程静音，用『扬声器/听筒』通道放声音试试"
             : [NSString stringWithFormat:@"已保存 · 峰值电平 %.3f ✅有声音", level];
         self.channelPicker.enabled = YES;
         self.qualityButton.enabled = YES;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ [self loadFiles]; });
     } else {
-        TRChannel channel = (TRChannel)self.channelPicker.selectedSegmentIndex;
+        // segmented: 0=麦克风 -> TRChannelMicrophone(1), 1=扬声器 -> TRChannelSpeaker(2)
+        TRChannel channel = self.channelPicker.selectedSegmentIndex == 0
+            ? TRChannelMicrophone : TRChannelSpeaker;
         NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
         fmt.dateFormat = @"yyyyMMdd_HHmmss";
-        NSString *name = [NSString stringWithFormat:@"call_%@.m4a", [fmt stringFromDate:[NSDate date]]];
+        NSString *name = [NSString stringWithFormat:@"call_%@.caf", [fmt stringFromDate:[NSDate date]]];
         NSURL *url = [[self docsURL] URLByAppendingPathComponent:name];
 
         NSError *error = nil;
@@ -237,7 +239,7 @@
                                               error:nil];
     NSMutableArray *result = [NSMutableArray array];
     for (NSURL *u in items) {
-        if ([u.pathExtension.lowercaseString isEqualToString:@"m4a"]) [result addObject:u];
+        if ([u.pathExtension.lowercaseString isEqualToString:@"caf"]) [result addObject:u];
     }
     [result sortUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) {
         NSDate *da, *db;
