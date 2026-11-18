@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>4.0</string>
+	<string>5.0</string>
 	<key>CFBundleVersion</key>
-	<string>5</string>
+	<string>6</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>用于把本机录音转成文字，识别优先在设备端完成，音频不会上传。</string>
 	<key>LSRequiresIPhoneOS</key>
