@@ -35,6 +35,13 @@
 
 @implementation ViewController
 
+// v9.4 ★关键修复：自动模式是常驻分段录音，切回 App 必须重新扫目录，
+// 否则通话后看到的还是打开 App 那一刻的旧列表（旧版「没有产生文件」的直接原因之一）。
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self loadFiles];
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"通话录音机 Pro";
@@ -154,7 +161,7 @@
     // 微信通话自动录音（需先注入 WeChatCallHook.dylib 到微信）
     UILabel *wxLbl = [[UILabel alloc] init];
     wxLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    wxLbl.text = @"③ 微信/QQ自动录音（v9.3 队列修复·免注入）";
+    wxLbl.text = @"③ 微信/QQ自动录音（v9.4 标准麦克风主路·免注入）";
     wxLbl.font = [UIFont systemFontOfSize:13];
     [self.view addSubview:wxLbl];
     UISwitch *wxSw = [[UISwitch alloc] init];
@@ -264,9 +271,9 @@
 - (void)toggleWeChatAuto:(UISwitch *)sw {
     [AppCallMonitor shared].thirdPartyAutoEnabled = sw.on;
     [self alert:sw.on
-        ? @"已开启【v9.3 自动录音】：装上即用，无需注入、无需脱壳。\n\n★真机日志定位到的根因：采集回调里原来用 `running` 决定是否把 buffer 重新入队，但 `running` 在 AudioQueueStart 之后才置位，前 3 个预分配 buffer 用完队列就永久饿死（日志 mic回调=3、采样字节=0）。本版改为只有显式停止才停止入队。\n\n★另外：「单点开始录音」改走标准麦克风队列（不依赖私有 tap），激活 AVAudioSession 后直接写 WAV，一定能出可播放文件。\n\n自动模式仍是三路 tap + WAV 直写，新增 [回调] 日志显示队列是否在跑、buffer 是否有字节。长按文件可选『文件体检』看峰值。"
+        ? @"已开启【v9.4 自动录音】：装上即用，无需注入、无需脱壳。\n\n★为什么之前一直没有文件：自动模式的麦克风走的是私有 tap，而这台设备上 tap 队列的回调缓冲区恒为 0 字节（不推流）；同时录音列表只在打开 App 时刷新，通话后切回来看到的还是旧列表。两点叠加，看起来就像「没有产生文件」。\n\n★本版：自动模式主路改用你已经单点验证成功的【标准麦克风队列】（PlayAndRecord + MixWithOthers，不强制外放、不打断微信/QQ 通话），每 60 秒存一段 WAV，主文件一定有声音；切回 App 会立即刷新列表。\n\napp-tap / 系统混音降级为对方声道增强，若该路有数据会另存 _双方.wav（左=自己 右=对方）；本机该路不推流属正常，不影响主文件。长按文件可选『文件体检』看峰值。"
         : @"已关闭自动录音，已停止并保存当前段。"
-          title:@"v9.3 自动录音"];
+          title:@"v9.4 自动录音"];
 }
 
 // 悬浮球开关（TrollStore 权限下可浮在微信/QQ 之上）
@@ -353,20 +360,29 @@
 - (void)recorderDidFinishWithURL:(NSURL *)url micLevel:(float)micLevel speakerLevel:(float)spkLevel {
     NSString *mic = micLevel < 0.001 ? @"无" : [NSString stringWithFormat:@"%.2f", micLevel];
     NSString *spk = spkLevel < 0.001 ? @"无" : [NSString stringWithFormat:@"%.2f", spkLevel];
-    NSString *body = [NSString stringWithFormat:@"自己:%@ 对方:%@ · %@", mic, spk, url.lastPathComponent];
-    [[NSNotificationCenter defaultCenter] postNotificationName:ManualRecordingDoneNotification
-                                                        object:nil
-                                                      userInfo:@{ @"body": body }];
+    BOOL autoSegment = [url.lastPathComponent hasPrefix:@"rec_"];
+    if (!autoSegment) {
+        NSString *body = [NSString stringWithFormat:@"自己:%@ 对方:%@ · %@", mic, spk, url.lastPathComponent];
+        [[NSNotificationCenter defaultCenter] postNotificationName:ManualRecordingDoneNotification
+                                                            object:nil
+                                                          userInfo:@{ @"body": body }];
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         [self loadFiles];
-        self.statusLabel.text = [NSString stringWithFormat:@"已保存 · 自己:%@ 对方:%@", mic, spk];
-        [[FloatingBall shared] tapFromBackground];
+        self.statusLabel.text = autoSegment
+            ? [NSString stringWithFormat:@"自动段已保存 · 自己:%@ 对方:%@", mic, spk]
+            : [NSString stringWithFormat:@"已保存 · 自己:%@ 对方:%@", mic, spk];
+        if (!autoSegment) [[FloatingBall shared] tapFromBackground];
     });
 }
 - (void)recorderDidFailWithMessage:(NSString *)msg {
+    // v9.4：自动模式每 60 秒一段，不能每段弹一次窗；只刷新列表 + 状态文字
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    BOOL autoOn = [ud objectForKey:@"CallRecorderThirdPartyAuto"] ? [ud boolForKey:@"CallRecorderThirdPartyAuto"] : YES;
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.statusLabel.text = @"合成失败";
-        [self alert:msg title:@"录音处理失败"];
+        [self loadFiles];
+        self.statusLabel.text = autoOn ? @"自动段无声音数据（文件已保留）" : @"合成失败";
+        if (!autoOn) [self alert:msg title:@"录音处理失败"];
     });
 }
 
