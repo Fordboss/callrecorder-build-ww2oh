@@ -869,7 +869,7 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
         if (ch->prerollCap < 1024) ch->prerollCap = 1024;
         ch->preroll = (SInt16 *)calloc(ch->prerollCap, sizeof(SInt16));
         ch->prerollCount = 0; ch->prerollPos = 0;
-        CRAppLog(@"[WAV] 常驻待机 v9.8：不建文件，只在内存留2秒预录；检测到人声才落盘 → %@_pNNN.wav（一通电话一个文件）", stem);
+        CRAppLog(@"[WAV] 常驻待机 v9.9：不建文件，只在内存留2秒预录；检测到人声才落盘 → %@_pNNN.wav（一通电话一个文件）", stem);
     } else {
         // ===== 手动单点录音：立即建文件（用户已明确按下按钮，就是要录） =====
         NSString *actual = url.path;
