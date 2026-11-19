@@ -42,6 +42,8 @@
     [super viewWillAppear:animated];
     [self loadFiles];
     [self startUITimer];   // v9.6：常驻录音在后台跑，界面必须持续跟随
+    // v9.6：每次回到 App 都确认常驻录音在跑 —— 被播放/来电/中断掐断后自动拉起
+    [[AppCallMonitor shared] ensureContinuousRecording];
 }
 
 - (void)viewDidDisappear:(BOOL)animated {
@@ -557,25 +559,46 @@
     if (ip.row >= self.files.count) return;
     if (self.player.isPlaying && self.playingIndex == ip.row) {
         [self.player stop]; self.player = nil; self.playingIndex = -1;
-        [[AVAudioSession sharedInstance] setActive:NO error:nil];
+        [self restoreRecordSession];   // ★v9.6 不能 deactivate，否则常驻录音被掐断
         [t reloadData]; return;
     }
-    // v9.2 ★关键修复：v9 起为 tap 全程不激活 AVAudioSession，AVAudioPlayer 会落到
-    // 默认 SoloAmbient category，被静音键 / 输出路由吞掉 → 「文件里有数据却听不到」。
-    // 播放前显式激活 Playback，播完 deactivate 让 tap 继续常驻。
+    // v9.6 ★第二个关键修复（用户反馈「点击播放声音很小、像不是从扬声器出来」）：
+    // 常驻录音一直占着 PlayAndRecord，输出默认停在【听筒】。
+    // 而且绝对不能为了播放去 setCategory/Playback —— 切换 category 会打断采集队列，
+    // 播放一下就把正在跑的通话录音掐死了。正确做法：会话保持不变，只把输出路由改到扬声器。
     AVAudioSession *sess = [AVAudioSession sharedInstance];
-    [sess setCategory:AVAudioSessionCategoryPlayback error:nil];
-    [sess setActive:YES error:nil];
+    if ([self autoModeOn]) {
+        // 常驻模式：会话已经是 active 的 PlayAndRecord，只切输出口
+        [sess overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:nil];
+    } else {
+        [sess setCategory:AVAudioSessionCategoryPlayback error:nil];
+        [sess setActive:YES error:nil];
+        [sess overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:nil];
+    }
     NSError *error = nil;
     AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithContentsOfURL:self.files[ip.row] error:&error];
-    if (!p) { [self alert:error.localizedDescription ?: @"文件可能为空" title:@"播放失败"]; return; }
+    if (!p) { [self restoreRecordSession]; [self alert:error.localizedDescription ?: @"文件可能为空" title:@"播放失败"]; return; }
     p.delegate = self;
+    p.volume = 1.0;                     // ← 确保不是被降到很低
     [p prepareToPlay];
     if (![p play]) {
+        [self restoreRecordSession];
         [self alert:@"播放器未能启动，请用「分享导出」发到微信里试听" title:@"播放失败"];
         return;
     }
     self.player = p; self.playingIndex = ip.row; [t reloadData];
+}
+
+// v9.6 ★播放结束后把输出路由恢复，但绝不 setActive:NO
+// （旧版 setActive:NO 会把常驻录音的采集队列掐死 —— 「时零时不灵」的来源之一）
+- (void)restoreRecordSession {
+    AVAudioSession *sess = [AVAudioSession sharedInstance];
+    [sess overrideOutputAudioPort:AVAudioSessionPortOverrideNone error:nil];
+    if ([self autoModeOn]) {
+        [[AppCallMonitor shared] ensureContinuousRecording];
+    } else {
+        [sess setActive:NO error:nil];
+    }
 }
 - (BOOL)tableView:(UITableView *)t canEditRowAtIndexPath:(NSIndexPath *)ip { return YES; }
 - (void)tableView:(UITableView *)t commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndexPath *)ip {
@@ -686,7 +709,7 @@
 
 - (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
     self.playingIndex = -1; self.player = nil;
-    [[AVAudioSession sharedInstance] setActive:NO error:nil];
+    [self restoreRecordSession];    // ★v9.6 播完交还会话，不能掐断常驻录音
     [self.tableView reloadData];
 }
 

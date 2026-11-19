@@ -16,6 +16,9 @@
 // v9.6：改采样率档位后让常驻录音按新档位重新开始（旧版常驻模式下改档位不生效）
 - (void)restartContinuousRecording;
 
+// v9.6：确保常驻录音在跑（被播放/来电/系统中断掐断后调它拉起）
+- (void)ensureContinuousRecording;
+
 // 诊断日志路径（ Documents/appcall_monitor.log ）
 @property (nonatomic, readonly) NSURL *logURL;
 - (NSString *)recentLog:(NSUInteger)maxLines;

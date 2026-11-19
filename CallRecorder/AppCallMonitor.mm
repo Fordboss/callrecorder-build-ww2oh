@@ -282,6 +282,18 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
           ok ? @"成功" : @"失败", err.localizedDescription ?: @"", name];
 }
 
+// v9.6：确保常驻录音在跑。任何"可能把引擎掐断"的路径（播放录音、来电、
+// 系统中断、切前后台）结束后都调它，而不是各自去判断。
+- (void)ensureContinuousRecording {
+    if (!self.thirdPartyAutoEnabled) return;
+    if (self.interrupted) return;      // 中断期间强行拉起只会失败
+    RecorderEngine *eng = [RecorderEngine shared];
+    if (eng.isRecording) return;
+    [self log:@"[保障] 常驻录音不在跑 → 拉起重开"];
+    self.lastCallbackCount = 0;
+    [self startContinuousRecording];
+}
+
 - (void)stopContinuousRecording {
     RecorderEngine *eng = [RecorderEngine shared];
     if (eng.isRecording) {
