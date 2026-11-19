@@ -8,8 +8,8 @@ options:
 
 settings:
   PRODUCT_NAME: CallRecorder
-  MARKETING_VERSION: "9.10"
-  CURRENT_PROJECT_VERSION: "22"
+  MARKETING_VERSION: "9.11"
+  CURRENT_PROJECT_VERSION: "23"
   IPHONEOS_DEPLOYMENT_TARGET: "15.0"
   TARGETED_DEVICE_FAMILY: "1"
   CODE_SIGN_STYLE: Manual
@@ -29,7 +29,7 @@ targets:
       - path: CallRecorder
     settings:
       INFOPLIST_FILE: CallRecorder/Info.plist
-      PRODUCT_BUNDLE_IDENTIFIER: com.wb.callrecorder
+      PRODUCT_BUNDLE_IDENTIFIER: com.wb.callrecorder.beta
       CODE_SIGN_ENTITLEMENTS: CallRecorder/CallRecorder.entitlements
     frameworks:
       - SDK: AudioToolbox.framework
@@ -38,5 +38,6 @@ targets:
       - SDK: CallKit.framework
       - SDK: UserNotifications.framework
       - SDK: Speech.framework
+      - SDK: Contacts.framework
       - SDK: Foundation.framework
       - SDK: UIKit.framework

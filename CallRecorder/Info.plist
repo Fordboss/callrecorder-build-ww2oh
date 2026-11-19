@@ -13,19 +13,21 @@
 	<key>CFBundleName</key>
 	<string>CallRecorder</string>
 	<key>CFBundleDisplayName</key>
-	<string>通话录音机</string>
+	<string>通话录音机 测试版</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>9.10</string>
+	<string>9.11</string>
 	<key>CFBundleVersion</key>
-	<string>22</string>
+	<string>23</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>用于把本机录音转成文字，识别优先在设备端完成，音频不会上传。</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>用于录制通话与麦克风声音，录音仅保存在本机，不会上传。</string>
+	<key>NSContactsUsageDescription</key>
+	<string>仅用于把通话录音文件按对方姓名命名（例如「20261119_1430_张三.wav」）。通讯录只在本机比对，不会上传，也不会保存或修改联系人。</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

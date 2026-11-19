@@ -40,10 +40,18 @@ typedef NS_ENUM(NSInteger, TRQuality) {
                      fileURL:(NSURL *)fileURL
                        error:(NSError **)error;
 
-// v9.5 ★常驻录音：启动一次后队列与 AVAudioSession 全程不重启，
+// v9.10 ★常驻录音：启动一次后队列与 AVAudioSession 全程不重启，
 // 回调内部每 60 秒滚动出一个可直接播放的 WAV（.part → .wav）。
 // 只有关闭自动开关 / App 退出才 stop。
 - (BOOL)startContinuousWithFileURL:(NSURL *)fileURL error:(NSError **)error;
+
+// v9.11 ★设置「对方名字」标记，用于给录音文件命名（时间_对方.wav）。
+// 必须在【主线程】调用；内部只做一次 memcpy 到双缓冲的另一块再翻指针，
+// 不加锁、不分配内存，音频回调线程读它绝不会有等待。
+// tag 传 nil 或空串＝清除（新文件退回纯时间戳命名）。
+- (void)setCallerTag:(NSString *)tag;
+// 当前生效的对方标记（诊断/界面用）。返回 nil 表示没有。
+- (NSString *)currentCallerTag;
 // 看门狗用：采集回调累计次数（每 5 秒不增长即判为队列卡死）
 @property (nonatomic, readonly) NSInteger callbackCount;
 // v9.7 看门狗用主路(-2 系统输出)回调数判活，比两路之和更准确

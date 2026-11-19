@@ -5,6 +5,9 @@
 #import <math.h>
 #import <stdio.h>
 #import <pthread.h>
+#import <time.h>
+#import <unistd.h>
+#import <string.h>
 
 #import "ATAudioTap.h"
 #import "ATAudioTapDescription.h"
@@ -165,6 +168,14 @@ static BOOL CRMixWavToStereo(NSURL *aURL, NSURL *bURL, NSURL *outURL,
     char                        wavDir[512];     // v9.5 常驻滚动：目录
     char                        wavStem[128];    // v9.5 常驻滚动：文件名主干
     int                         wavPart;         // v9.5 当前段序号
+    // ===== v9.11 文件名带「对方名字」 =====
+    // 名字由主线程预置，音频回调只读 —— 绝不在此加锁，否则回调阻塞会拖垮 AudioQueue。
+    // 双缓冲 + 单写指针：主线程永远写「非当前」那一块再翻指针，
+    // 回调先读指针再用对应那块，读写不会撞在一起（翻转间隔 5 秒，读取只要微秒级）。
+    char                        callerTagA[64];  // 对方名字标记（缓冲A）
+    char                        callerTagB[64];  // 对方名字标记（缓冲B）
+    volatile int                tagActive;       // 当前生效的缓冲：0=A 1=B
+    char                        wavName[192];    // ★本次正在写的文件的完整主干（开文件时定下，封存用它）
     UInt64                      wavRollFrames;   // v9.5 滚动阈值（帧）
     BOOL                        wavRolling;      // v9.5 是否启用滚动
     UInt64                      wavSilentFrames; // v9.6 连续静音帧数（断话检测）
@@ -332,6 +343,7 @@ static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, UInt64
     BOOL _monitoring;
     BOOL _autoMode;
     BOOL _appTapActive;
+    NSString *_callerTag;   // v9.11 当前对方标记（文件名用）
 }
 - (CaptureChannel *)primaryChannel;   // v9.7 前置声明：primaryCallbackCount 先用后定义
 @end
@@ -424,6 +436,25 @@ static void CRWavOpenPart(CaptureChannel *ch, BOOL withPreroll);
 static void CRWavSeal(CaptureChannel *ch, NSString *reason);
 static void CRWavRollIfNeeded(CaptureChannel *ch);
 
+// v9.11 构造这一通的文件名主干：时间戳_对方名字
+//   * 时间戳取「开文件的这一刻」＝ 这通电话开口的时刻（含 2 秒预录，误差 <2s）
+//   * 对方名字由主线程预置在 callerTag 里；取不到就只留时间戳（降级）
+// ★只用 CPU（time/localtime_r/memcpy），不做任何磁盘操作 —— 本函数在音频回调里跑。
+static void CRBuildName(CaptureChannel *ch, char *outName, size_t cap) {
+    if (!ch || !outName || cap == 0) return;
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tmv);
+
+    // 双缓冲读：先取生效索引，再只读那一块（主线程只写另一块）
+    int idx = ch->tagActive;
+    const char *tag = (idx == 1) ? ch->callerTagB : ch->callerTagA;
+    if (tag[0]) snprintf(outName, cap, "%s_%s", ts, tag);
+    else        snprintf(outName, cap, "%s", ts);
+}
+
 // 封存当前段：回填头 → 改名 .wav → 回到"只进内存"的待机状态
 static void CRWavSeal(CaptureChannel *ch, NSString *reason) {
     if (!ch || !ch->wav) return;
@@ -431,9 +462,10 @@ static void CRWavSeal(CaptureChannel *ch, NSString *reason) {
     CRWavFinalize(ch->wav, frames, 1);
     fclose(ch->wav);
     ch->wav = NULL;
+    // v9.11：文件名在开文件时就定死了（时间戳_对方），封存只需去掉 .part 后缀
     char cur[768], fin[768];
-    snprintf(cur, sizeof(cur), "%s/%s_p%03d.wav.part", ch->wavDir, ch->wavStem, ch->wavPart);
-    snprintf(fin, sizeof(fin), "%s/%s_p%03d.wav", ch->wavDir, ch->wavStem, ch->wavPart);
+    snprintf(cur, sizeof(cur), "%s/%s.wav.part", ch->wavDir, ch->wavName);
+    snprintf(fin, sizeof(fin), "%s/%s.wav", ch->wavDir, ch->wavName);
     rename(cur, fin);
     int sealed = ch->wavPart;
     ch->wavPart++;
@@ -445,8 +477,8 @@ static void CRWavSeal(CaptureChannel *ch, NSString *reason) {
     ch->gateBlockN = 0; ch->gateLoudN = 0;
     ch->prerollCount = 0;
     ch->prerollPos = 0;
-    CRAppLog(@"[录音] ⏹ 第%d段已封存（%.1f秒, %@）→ 回到待机，没说话就不再建文件",
-             sealed, (double)frames / (double)ch->wavRate, reason ?: @"—");
+    CRAppLog(@"[录音] ⏹ 第%d段已封存（%.1f秒, %@）→ %s.wav",
+             sealed, (double)frames / (double)ch->wavRate, reason ?: @"—", ch->wavName);
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter] postNotificationName:@"CallRecorderSegmentRolled" object:nil];
     });
@@ -476,9 +508,35 @@ static const UInt32 kSoundRunBlocks = 5;
 // 打开一个新的 .wav.part 开始正式录；withPreroll=YES 时把触发前的 2 秒预录补进去
 static void CRWavOpenPart(CaptureChannel *ch, BOOL withPreroll) {
     if (!ch || !ch->wavDir[0]) return;
-    char cur[768];
-    snprintf(cur, sizeof(cur), "%s/%s_p%03d.wav.part", ch->wavDir, ch->wavStem, ch->wavPart);
-    FILE *f = fopen(cur, "wb");
+    // v9.11：开文件这一刻才定名字 → 「时间_对方」。同一通电话内不会变（不切段就不重开文件）。
+    CRBuildName(ch, ch->wavName, sizeof(ch->wavName));
+
+    // ★防覆盖：绝不能让新录音把已有录音截断或覆盖。
+    //   .part 用 "wbx"（独占创建，已存在则失败）；
+    //   同时还要检查同名的已封存 .wav —— 否则最后 rename 会静默盖掉旧录音。
+    char cur[768], fin[768];
+    snprintf(cur, sizeof(cur), "%s/%s.wav.part", ch->wavDir, ch->wavName);
+    snprintf(fin, sizeof(fin), "%s/%s.wav", ch->wavDir, ch->wavName);
+    FILE *f = NULL;
+    if (access(fin, F_OK) != 0) f = fopen(cur, "wbx");   // .wav 不存在才试
+    for (int n = 2; n <= 20 && !f; n++) {
+        // ★必须用临时缓冲：把 wavName 同时当源和目标传给 snprintf 是未定义行为，
+        //   实际会写出 "时间_对方_2_3_4..." 这种累积串。
+        char base[192];
+        snprintf(base, sizeof(base), "%s", ch->wavName);
+        // 去掉上一次循环可能加过的 "_n"，避免叠加
+        char *us = strrchr(base, '_');
+        if (us && strlen(us) <= 3) {   // 形如 "_2" ~ "_20"
+            BOOL allDigit = YES;
+            for (char *p = us + 1; *p; p++) if (*p < '0' || *p > '9') { allDigit = NO; break; }
+            if (allDigit) *us = '\0';
+        }
+        snprintf(ch->wavName, sizeof(ch->wavName), "%s_%d", base, n);
+        snprintf(cur, sizeof(cur), "%s/%s.wav.part", ch->wavDir, ch->wavName);
+        snprintf(fin, sizeof(fin), "%s/%s.wav", ch->wavDir, ch->wavName);
+        if (access(fin, F_OK) != 0) f = fopen(cur, "wbx");
+    }
+    if (!f) { CRAppLog(@"[录音] 无法创建 %s（同名文件已存在或磁盘不可写）", cur); return; }
     if (!f) { CRAppLog(@"[录音] 无法创建 %s", cur); return; }
     CRWavHeader(f, ch->wavRate, 1);
     ch->wav = f;
@@ -499,7 +557,7 @@ static void CRWavOpenPart(CaptureChannel *ch, BOOL withPreroll) {
     ch->prerollPos = 0;
     ch->wavSilentFrames = 0;
     ch->wavHadSound = YES;   // 已经确认有人声，停止时这段必须保留
-    CRAppLog(@"[录音] ▶ 检测到人声 → 开始第%d段（含2秒预录，队列不重启）", ch->wavPart);
+    CRAppLog(@"[录音] ▶ 检测到人声 → 开始录音（含2秒预录，队列不重启）→ %s.wav", ch->wavName);
 }
 
 // 有声音就落盘，没声音就把样本塞进内存环形缓冲。
@@ -1035,6 +1093,9 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
         if (!_mic) { [self fail:@"三路都起不来" error:error]; return NO; }
     }
     _recording = YES;
+    // v9.11：新通道刚建立，把已经解析好的对方名字刷进去，
+    // 否则「名字先到、队列后建立」的顺序会让第一个文件丢名字。
+    if (_callerTag.length) [self setCallerTag:_callerTag];
     CRAppLog(@"[常驻] v9.7 启动OK | 主路=-2系统输出(出文件)=%@ 副路=-3麦克风(仅电平)=%@ | 不激活会话(与v6.0一致) | 文件=%@",
              _sys ? @"OK" : @"FAIL", _mic ? @"OK" : @"FAIL", stem);
     return YES;
@@ -1075,6 +1136,38 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     if (!ch || !ch->wavRolling) return 0;
     return ch->wav ? ch->wavPart : 0;   // 0 = 待机中（还没检测到人声，没建文件）
 }
+
+#pragma mark - v9.11 对方名字标记（文件名用）
+
+// ★线程安全设计（这才是关键，别改坏了）：
+//   写：主线程调用，写到「当前未生效」的那一块，写完整后再翻 tagActive 指针。
+//   读：音频回调里只读 tagActive 指向的那一块。翻指针是单条 int 写，原子。
+// 因为写的那块和读的那块永远不是同一块，两边不需要锁，也不会读到写了一半的串。
+// 64 字节的 strncpy 在回调里最多几十纳秒，比 pthread_mutex_lock 安全太多。
+static void CRApplyTag(CaptureChannel *ch, const char *tag) {
+    if (!ch) return;
+    int cur = ch->tagActive;
+    char *dst = (cur == 1) ? ch->callerTagA : ch->callerTagB;   // 写另一块
+    memset(dst, 0, sizeof(ch->callerTagA));
+    if (tag && tag[0]) {
+        strncpy(dst, tag, sizeof(ch->callerTagA) - 1);
+        dst[sizeof(ch->callerTagA) - 1] = '\0';
+    }
+    ch->tagActive = (cur == 1) ? 0 : 1;                         // 写完再翻
+}
+
+- (void)setCallerTag:(NSString *)tag {
+    const char *utf8 = tag.length ? tag.UTF8String : NULL;
+    // 主路出文件，标记必须给主路；主路不存在时给当前在出文件的那一路
+    CaptureChannel *main = _sys ?: _mic;
+    if (main) CRApplyTag(main, utf8);
+    // 副路只是混音源，不出文件，但保持同步，避免主路挂掉退回副路出文件时名字丢了
+    if (_sys && _mic) CRApplyTag(_mic, utf8);
+    _callerTag = tag.length ? [tag copy] : nil;
+}
+
+- (NSString *)currentCallerTag { return _callerTag; }
+
 - (double)currentSegmentSeconds {
     CaptureChannel *ch = [self primaryChannel];
     if (!ch || ch->wavRate == 0 || !ch->wav) return 0;
@@ -1255,9 +1348,10 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     if (ch->wav) {
         CRWavFinalize(ch->wav, ch->wavFrames, 1); fclose(ch->wav); ch->wav = NULL;
         if (ch->wavRolling) {
+            // v9.11：名字在开文件时已定（时间_对方），这里只去 .part 后缀
             char cur[768], fin[768];
-            snprintf(cur, sizeof(cur), "%s/%s_p%03d.wav.part", ch->wavDir, ch->wavStem, ch->wavPart);
-            snprintf(fin, sizeof(fin), "%s/%s_p%03d.wav", ch->wavDir, ch->wavStem, ch->wavPart);
+            snprintf(cur, sizeof(cur), "%s/%s.wav.part", ch->wavDir, ch->wavName);
+            snprintf(fin, sizeof(fin), "%s/%s.wav", ch->wavDir, ch->wavName);
             if (ch->wavHadSound) rename(cur, fin);
             else remove(cur);
         }

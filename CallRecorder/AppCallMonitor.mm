@@ -1,10 +1,12 @@
 #import "AppCallMonitor.h"
 #import "RecorderEngine.h"
+#import "CallerResolver.h"
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <math.h>
 #import <sys/sysctl.h>
 #import <sys/types.h>
+#import <Contacts/Contacts.h>
 
 // ============================================================
 // v9 —— 官方免费版配方：按「真实进程 PID」做 app-tap
@@ -103,6 +105,8 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 @property (nonatomic, assign) NSInteger stallTicks;           // v9.7 回调连续不增长的次数
 @property (nonatomic, assign) NSInteger failStreak;           // v9.7 连续重建失败次数
 @property (nonatomic, assign) NSInteger nextRebuildTick;      // v9.7 退避：到这个 tick 才能再重建
+- (void)refreshCallerTagForEngine:(RecorderEngine *)eng;       // v9.11 对方名字刷新
+- (void)requestContactsAccessIfNeeded;                          // v9.11 通讯录授权
 @end
 
 @implementation AppCallMonitor
@@ -154,15 +158,20 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 #pragma mark - 启动
 
 - (void)start {
-    [self log:@"===== 常驻录音 v9.10 (v9.7配方 + 一通一个文件) 启动 ====="];
+    [self log:@"===== 常驻录音 v9.11 (v9.10 + 文件名带对方) 启动 ====="];
     [self log:@"★关键: v6.0 能自动录音 / v9.4~v9.6 不能，唯一差异是录音通道"];
     [self log:@"★v6.0: 私有tap(-2系统输出 + -3麦克风), 全程不激活AVAudioSession"];
     [self log:@"★v9.4+: 标准麦克风队列 + setActive:YES → 微信/QQ通话把会话抢走, 回调恒为0"];
     [self log:@"★v9.7: 回到 v6.0 配方(双tap + 不激活会话), 主路-2出文件, 副路-3只测电平"];
     [self log:@"★v9.10: 只把『每60秒一段』改成『一通一个文件』, 采集与写盘代码与v9.7完全一致"];
+    [self log:@"★v9.11: 文件名改为『时间_对方.wav』; 系统电话查通讯录取真名, 微信/QQ只能标App名"];
     [self log:@"★另修: 中断结束后必须重建队列(旧版只打'队列仍在继续使用', 队列从此不回调)"];
     [self log:@"★另修: 发声判定改用0.1秒块能量(旧版逐采样比较, 人声过零点大量漏检→永不建文件)"];
     [self log:@"不注入/不脱壳, 装上即用, 一通电话一个WAV(静音60秒收尾), 留最近%ld个", (long)kKeepSegments];
+
+    // v9.11：请求通讯录权限（只为给录音文件起名）。
+    // 用户拒绝也不影响录音 —— CallerResolver 会检测到未授权并退回号码/App名。
+    [self requestContactsAccessIfNeeded];
 
     NSArray<NSString *> *names = nil;
     NSArray<NSNumber *> *pids = FindCallAppPIDs(&names);
@@ -249,6 +258,14 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
     }
 
     if (!eng.isRecording) { [self log:@"[实时] 未录音(自动开关关闭)"]; return; }
+
+    // ★v9.11 刷新「对方名字」标记（文件名用）
+    // 放在主线程定时器里做：TelephonyUtilities 查询 + 通讯录遍历都有磁盘/进程开销，
+    // 绝不能进音频回调线程。每 5 秒一次，够跟上通话切换。
+    // 只有「在待机、还没开文件」时才更新名字：已经开录的文件名不能中途变，
+    // 否则一个电话中途改名会让用户看到两个半截文件。
+    [self refreshCallerTagForEngine:eng];
+
     float mic = 0, app = 0, sys = 0;
     [eng consumeAutoLevelsMic:&mic app:&app sys:&sys];
     // v9.7 两路分开显示：-2 是主路(通话声音在这里)，-3 是副路(自己)
@@ -262,8 +279,54 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
     if (self.diagTick % 24 == 0) [self cleanupOldSegments];
 }
 
-- (void)onAppActive:(NSNotification *)n {
-    RecorderEngine *eng = [RecorderEngine shared];
+// ★v9.11 刷新对方名字
+// 规则：
+//   1. 只在【待机】时更新（currentSegmentIndex == 0）。
+//      正在录的文件名已经在 CRWavOpenPart 里定死，中途改标记只会让下一通的名字提前生效，
+//      导致正在录的这一通被封存时名字对不上 —— 所以录制中一律不动。
+//   2. 名字变化时才打日志，避免每 5 秒刷一条一样的。
+//   3. 全部包在 @try 里：对方识别是"锦上添花"，绝不能因为它抛异常影响录音主流程。
+- (void)refreshCallerTagForEngine:(RecorderEngine *)eng {
+    @try {
+        BOOL idle = ([eng currentSegmentIndex] == 0);
+        if (!idle) return;   // 正在录，名字已定，不动
+
+        CallerResolver *cr = [CallerResolver shared];
+        NSString *name = [cr currentCallerName];
+        NSString *old  = [eng currentCallerTag];
+        BOOL same = (name == nil && old == nil) || [name isEqualToString:old];
+        if (same) return;
+
+        [eng setCallerTag:name];
+        [self log:@"[对方] 标记更新：%@ → %@（%@）",
+              old ?: @"(无)", name ?: @"(清空)", cr.lastDiagnostic ?: @"—"];
+    } @catch (NSException *e) {
+        [self log:@"[对方] ⚠ 识别异常（不影响录音）：%@", e.reason ?: @"?"];
+    }
+}
+
+// ★v9.11 通讯录授权（只为文件名）
+// 拒绝授权不影响录音：CallerResolver 会检测未授权并退回「号码脱敏 / App名 / 纯时间戳」。
+- (void)requestContactsAccessIfNeeded {
+    @try {
+        CNAuthorizationStatus st = [CNContactStore authorizationStatusForEntityType:CNEntityTypeContacts];
+        if (st == CNAuthorizationStatusNotDetermined) {
+            [[CNContactStore new] requestAccessForEntityType:CNEntityTypeContacts
+                                           completionHandler:^(BOOL granted, NSError *err) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self log:@"[对方] 通讯录授权 %@%@", granted ? @"已允许" : @"被拒绝",
+                          granted ? @"（可用联系人名给文件命名）" : @"（降级为号码/App名）"];
+                });
+            }];
+        } else {
+            [self log:@"[对方] 通讯录权限状态=%ld（1=拒绝 2=已授权 3=受限）", (long)st];
+        }
+    } @catch (NSException *e) {
+        [self log:@"[对方] 授权请求异常: %@", e.reason ?: @"?"];
+    }
+}
+
+- (void)onAppActive:(NSNotification *)n {    RecorderEngine *eng = [RecorderEngine shared];
     [self log:@"App回到前台 | 常驻录音=%@ 回调=%ld 自愈%ld次",
           eng.isRecording ? @"Y" : @"N", (long)[eng callbackCount], (long)self.watchdogRestarts];
 }
@@ -321,6 +384,10 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
     RecorderEngine *eng = [RecorderEngine shared];
     if (eng.isRecording) return YES;   // 单队列常驻，绝不重复启动
 
+    // ★v9.11 这里的文件名只是「给我一个目录 + 占位名」，不再是最终文件名。
+    // 真正落盘的名字由 RecorderEngine 在【检测到人声、开文件的那一刻】生成：
+    //   时间戳_对方.wav
+    // 旧版用启动时刻的时间戳，导致所有通话都挤在同一个 stem 上（时间永远不对）。
     NSDateFormatter *fmt = [NSDateFormatter new]; fmt.dateFormat = @"yyyyMMdd_HHmmss";
     NSString *name = [NSString stringWithFormat:@"rec_%@.wav", [fmt stringFromDate:[NSDate date]]];
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -329,8 +396,8 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
     NSError *err = nil;
     BOOL ok = [eng startContinuousWithFileURL:url error:&err];
     self.lastCallbackCount = 0;
-    [self log:@"▶ 常驻录音启动=%@ %@ | 主路=-2系统输出 副路=-3麦克风 (与v6.0同配方, 不激活会话) (基础名 %@)",
-          ok ? @"成功" : @"失败", err.localizedDescription ?: @"", name];
+    [self log:@"▶ 常驻录音启动=%@ %@ | 主路=-2系统输出 副路=-3麦克风 (与v6.0同配方, 不激活会话) | 实际文件名=时间_对方.wav",
+          ok ? @"成功" : @"失败", err.localizedDescription ?: @""];
     return ok;
 }
 
@@ -374,7 +441,16 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
         NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
         NSMutableArray *recs = [NSMutableArray array];
         for (NSString *f in files) {
-            if ([f hasPrefix:@"rec_"] && ([f hasSuffix:@".wav"] || [f hasSuffix:@".m4a"])) {
+            // v9.11：文件名不再以 rec_ 开头（改成「时间_对方.wav」），
+            // 旧前缀判断会让清理彻底失效、文件无限堆积。
+            // 改成「按扩展名 + 排除混音中间文件」识别，对新旧命名都成立。
+            NSString *low = f.lowercaseString;
+            BOOL isRec = [low hasSuffix:@".wav"] || [low hasSuffix:@".m4a"];
+            if (isRec) {
+                // 排除 _mic/_spk/_app/_sys/_mix/_direct 这类中间路文件
+                if ([low containsString:@"_mic"] || [low containsString:@"_spk"] ||
+                    [low containsString:@"_app"] || [low containsString:@"_sys"] ||
+                    [low containsString:@"_mix"] || [low containsString:@"_direct"]) continue;
                 NSString *full = [docs stringByAppendingPathComponent:f];
                 NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:full error:nil];
                 [recs addObject:@{@"path":full, @"date":attr[NSFileCreationDate] ?: [NSDate date]}];

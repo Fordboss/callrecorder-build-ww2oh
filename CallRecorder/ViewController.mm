@@ -80,20 +80,23 @@
     if (e.isRecording) {
         NSInteger seg = [e currentSegmentIndex];
         double sec = [e currentSegmentSeconds];
+        // v9.11：把识别到的对方显示出来，用户一眼知道这通录的是谁
+        NSString *tag = [e currentCallerTag];
+        NSString *who = tag.length ? tag : @"未识别";
         if (seg > 0) {
             // 正在录一通真人声：按钮上的秒数每秒往前走，一眼确认在录
             [self.recordButton setTitle:[NSString stringWithFormat:@"● 录音中 %02ld:%02ld",
                                          (long)((NSInteger)sec / 60), (long)((NSInteger)sec % 60)]
                                forState:UIControlStateNormal];
             self.recordButton.backgroundColor = [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:1.0];
-            self.statusLabel.text = [NSString stringWithFormat:@"正在录通话（一通一个文件）· 静音 60 秒收尾 · 已存 %ld 个",
-                                     (long)[e sealedSegmentCount]];
+            self.statusLabel.text = [NSString stringWithFormat:@"正在录：%@ · 静音 60 秒收尾 · 已存 %ld 个",
+                                     who, (long)[e sealedSegmentCount]];
         } else {
             // 待机：没人说话就不建文件，这是 v9.6 专门修「没通话也一堆文件」
             [self.recordButton setTitle:@"◉ 待命中 · 检测到说话才录" forState:UIControlStateNormal];
             self.recordButton.backgroundColor = [UIColor colorWithRed:0.20 green:0.45 blue:0.85 alpha:1.0];
             self.statusLabel.text = [NSString stringWithFormat:
-                @"待命中：没有通话就不产生任何文件 · 已存 %ld 个", (long)[e sealedSegmentCount]];
+                @"待命 · 当前对方：%@ · 已存 %ld 个", who, (long)[e sealedSegmentCount]];
         }
         self.recordButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
         // v9.7：两路分别显示，能直接看出主路(-2 系统输出)有没有收到声音
@@ -465,7 +468,10 @@
 - (void)recorderDidFinishWithURL:(NSURL *)url micLevel:(float)micLevel speakerLevel:(float)spkLevel {
     NSString *mic = micLevel < 0.001 ? @"无" : [NSString stringWithFormat:@"%.2f", micLevel];
     NSString *spk = spkLevel < 0.001 ? @"无" : [NSString stringWithFormat:@"%.2f", spkLevel];
-    BOOL autoSegment = [url.lastPathComponent hasPrefix:@"rec_"];
+    // v9.11：文件名不再以 rec_ 开头（改成「时间_对方.wav」），旧前缀判断会失效，
+    // 导致常驻录音也弹通知、悬浮球乱跳。改用「自动开关是否开着」判断，
+    // 这才是真正的语义（自动开关开着 = 常驻录音在管，不该打扰用户）。
+    BOOL autoSegment = [self autoModeOn];
     if (!autoSegment) {
         NSString *body = [NSString stringWithFormat:@"自己:%@ 对方:%@ · %@", mic, spk, url.lastPathComponent];
         [[NSNotificationCenter defaultCenter] postNotificationName:ManualRecordingDoneNotification
