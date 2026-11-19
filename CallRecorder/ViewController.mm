@@ -81,19 +81,19 @@
         NSInteger seg = [e currentSegmentIndex];
         double sec = [e currentSegmentSeconds];
         if (seg > 0) {
-            // 正在录一段真人声：按钮上的秒数每秒往前走，一眼确认在录
-            [self.recordButton setTitle:[NSString stringWithFormat:@"● 录音中  第%ld段 %02ld:%02ld",
-                                         (long)seg, (long)((NSInteger)sec / 60), (long)((NSInteger)sec % 60)]
+            // v9.8 正在录的这一通：秒数一直在走，一眼确认在录（一通电话一个文件，不再切段）
+            [self.recordButton setTitle:[NSString stringWithFormat:@"● 录音中  %02ld:%02ld",
+                                         (long)((NSInteger)sec / 60), (long)((NSInteger)sec % 60)]
                                forState:UIControlStateNormal];
             self.recordButton.backgroundColor = [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:1.0];
-            self.statusLabel.text = [NSString stringWithFormat:@"正在录人声 · 已封存 %ld 段 · 说完静音 15 秒自动存",
+            self.statusLabel.text = [NSString stringWithFormat:@"正在录通话（一通一个文件）· 静音 5 分钟自动收尾 · 已存 %ld 个",
                                      (long)[e sealedSegmentCount]];
         } else {
             // 待机：没人说话就不建文件，这是 v9.6 专门修「没通话也一堆文件」
             [self.recordButton setTitle:@"◉ 待命中 · 检测到说话才录" forState:UIControlStateNormal];
             self.recordButton.backgroundColor = [UIColor colorWithRed:0.20 green:0.45 blue:0.85 alpha:1.0];
             self.statusLabel.text = [NSString stringWithFormat:
-                @"待命中：没有通话就不产生任何文件 · 已封存 %ld 段", (long)[e sealedSegmentCount]];
+                @"待命中：没有通话就不产生任何文件 · 已存 %ld 个", (long)[e sealedSegmentCount]];
         }
         self.recordButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
         // v9.7：两路分别显示，能直接看出主路(-2 系统输出)有没有收到声音
@@ -427,11 +427,11 @@
         RecorderEngine *e = [RecorderEngine shared];
         [self alert:[NSString stringWithFormat:
                 @"常驻录音开关（③）是开着的，所以按钮被常驻录音接管：\n\n"
-                @"运行状态：%@\n当前第 %ld 段，本段已录 %.1f 秒\n采集回调累计：%ld 次\n采样率：%ld Hz\n\n"
-                @"文件每满 60 秒封存一个，所以通话超过 1 分钟才会在列表里看到新文件。\n\n"
+                @"运行状态：%@\n本通已录 %.1f 分钟（%.1f 秒）\n采集回调累计：%ld 次\n采样率：%ld Hz\n\n"
+                @"一通电话从头到尾只有一个文件，边录边可播放；静音满 5 分钟才算这一通结束。\n\n"
                 @"若要手动单点录音，请先把开关③关掉。",
                 e.isRecording ? @"正常录音中" : @"未在录音（看门狗正在重建）",
-                (long)MAX((NSInteger)1, [e currentSegmentIndex]), [e currentSegmentSeconds],
+                [e currentSegmentSeconds] / 60.0, [e currentSegmentSeconds],
                 (long)[e callbackCount], (long)[e outputSampleRate]]
               title:@"常驻录音运行中"];
         return;
