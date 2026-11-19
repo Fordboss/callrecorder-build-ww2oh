@@ -148,14 +148,17 @@ static NSString *CRMaskPhone(NSString *phone) {
 // 取当前通话（依次尝试 currentCall → displayedCall → calls → displayedCalls）
 - (id)activeCall {
     if (![self loadTU]) return nil;
-    Class cls = NSClassFromString(@"TUCallCenter");
+    // ★用 id 接类对象：对 Class 直接发类方法，编译器要求能看见声明；
+    //   id 是无类型消息接收者，配合 respondsToSelector 才既能编过又不依赖私有头。
+    id cls = NSClassFromString(@"TUCallCenter");
     if (!cls) { self.diag = @"TUCallCenter 类不存在"; return nil; }
 
-    CRProxyTUCallCenter *center = nil;
+    id centerRaw = nil;
     if ([cls respondsToSelector:@selector(sharedInstance)]) {
-        center = [(CRProxyTUCallCenter *)cls sharedInstance];
+        centerRaw = [cls sharedInstance];
     }
-    if (!center) { self.diag = @"TUCallCenter 无实例"; return nil; }
+    if (!centerRaw) { self.diag = @"TUCallCenter 无实例"; return nil; }
+    CRProxyTUCallCenter *center = (CRProxyTUCallCenter *)centerRaw;
 
     NSMutableArray *candidates = [NSMutableArray array];
     if ([center respondsToSelector:@selector(currentCall)]) {
