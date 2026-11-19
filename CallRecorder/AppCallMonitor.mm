@@ -100,6 +100,10 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 @property (nonatomic, assign) NSInteger lastCallbackCount;   // 看门狗：上一次回调数
 @property (nonatomic, assign) NSInteger watchdogRestarts;   // 自愈次数（日志用）
 @property (nonatomic, assign) BOOL interrupted;             // v9.6 系统音频中断中（来电/Siri/其他App抢麦）
+@property (nonatomic, strong) NSDate *interruptBeganAt;      // v9.7 中断开始时间（日志算出通话时长）
+@property (nonatomic, assign) NSInteger stallTicks;           // v9.7 回调连续不增长的次数
+@property (nonatomic, assign) NSInteger failStreak;           // v9.7 连续重建失败次数
+@property (nonatomic, assign) NSInteger nextRebuildTick;      // v9.7 退避：到这个 tick 才能再重建
 @end
 
 @implementation AppCallMonitor
@@ -151,11 +155,13 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 #pragma mark - 启动
 
 - (void)start {
-    [self log:@"===== 常驻录音 v9.6 (界面同步 + 断话封存 + 中断保护) 启动 ====="];
-    [self log:@"★根因1: 常驻录音由后台自启, 从不经过界面 → 按钮/电平永远不动(用户反馈'有文件但按钮没动')"];
-    [self log:@"★根因2: 只按满60秒封存 → 短通话打完文件还留在.part, 表现为'时零时不灵'"];
-    [self log:@"★根因3: 来电/语音时系统中断采集, 看门狗误判卡死并每5秒盲目重建(必失败)"];
-    [self log:@"★本版: 界面0.5秒跟随 | 静音15秒即封存 | 中断期间挂起看门狗, 中断结束立刻恢复"];
+    [self log:@"===== 常驻录音 v9.7 (回归v6.0双tap配方) 启动 ====="];
+    [self log:@"★关键: v6.0 能自动录音 / v9.4~v9.6 不能，唯一差异是录音通道"];
+    [self log:@"★v6.0: 私有tap(-2系统输出 + -3麦克风), 全程不激活AVAudioSession"];
+    [self log:@"★v9.4+: 标准麦克风队列 + setActive:YES → 微信/QQ通话把会话抢走, 回调恒为0"];
+    [self log:@"★v9.7: 回到 v6.0 配方(双tap + 不激活会话), 主路-2出文件, 副路-3只测电平"];
+    [self log:@"★另修: 中断结束后必须重建队列(旧版只打'队列仍在继续使用', 队列从此不回调)"];
+    [self log:@"★另修: 发声判定改用0.1秒块能量(旧版逐采样比较, 人声过零点大量漏检→永不建文件)"];
     [self log:@"不注入/不脱壳, 装上即用, 每%.0f秒或断话即滚动一个WAV, 留最近%ld段", kSegmentSeconds, (long)kKeepSegments];
 
     NSArray<NSString *> *names = nil;
@@ -185,7 +191,9 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 
 - (void)diagTick:(NSTimer *)t {
     RecorderEngine *eng = [RecorderEngine shared];
-    NSInteger cb = [eng callbackCount];
+    // v9.7：用主路(-2 系统输出)回调数判活 —— 通话中麦克风可能被独占，
+    // 但系统输出 tap 才是"有没有录到通话"的真实指标。
+    NSInteger cb = [eng primaryCallbackCount];
     self.diagTick++;
 
     // v9.6：系统音频中断期间不要去碰队列 —— 此时重建必定失败，只会刷日志
@@ -199,27 +207,57 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
     if (self.thirdPartyAutoEnabled && !eng.isRecording) {
         [self log:@"[看门狗] 引擎已停止 → 立即重建常驻录音"];
         self.lastCallbackCount = 0;
+        self.stallTicks = 0;
         [self startContinuousRecording];
         return;
     }
-    // ★看门狗 2：引擎在跑但 5 秒内回调数完全不增长 → 队列卡死，重建
-    if (self.thirdPartyAutoEnabled && self.lastCallbackCount > 0 && cb == self.lastCallbackCount) {
-        self.watchdogRestarts++;
-        [self log:@"[看门狗] 5秒内回调无增长(回调=%ld, 队列卡死) → 停止并重建 第%ld次",
-              (long)cb, (long)self.watchdogRestarts];
-        [eng stop];
-        self.lastCallbackCount = 0;
-        [self startContinuousRecording];
-        return;
+
+    // ★v9.7 看门狗 2：主路回调不增长就重建。
+    // 旧版条件 `lastCallbackCount > 0` 有个坑：重建失败后 lastCallbackCount 被清成 0，
+    // 于是"0 → 0"永远满足不了 `cb == lastCallbackCount && lastCallbackCount > 0`，
+    // 卡死检测直接失效，只能等 5 秒后的"引擎已停止"分支去救，白等一轮。
+    // 现在：连续 2 个 tick（约 4 秒）都不增长就判定卡死，且 0→0 也判卡死。
+    // 另外加了失败退避：连续重建失败时逐步拉长间隔，避免"每2秒重建一次全失败"空转刷屏。
+    if (self.thirdPartyAutoEnabled) {
+        if (cb == self.lastCallbackCount) {
+            self.stallTicks++;
+        } else {
+            self.stallTicks = 0;
+            self.lastCallbackCount = cb;
+            self.failStreak = 0;
+            self.nextRebuildTick = 0;
+        }
+        BOOL backoffOK = (self.diagTick >= self.nextRebuildTick);
+        if (self.stallTicks >= 2 && backoffOK) {
+            self.watchdogRestarts++;
+            [self log:@"[看门狗] 主路回调连续%ld次无增长(回调=%ld, 队列卡死) → 停止并重建 第%ld次",
+                  (long)self.stallTicks, (long)cb, (long)self.watchdogRestarts];
+            [eng stop];
+            self.lastCallbackCount = 0;
+            self.stallTicks = 0;
+            BOOL ok = [self startContinuousRecordingReturningOK];
+            if (!ok) {
+                // 退避：第1次失败等2个tick，第2次4个，第3次起8个（约16秒一次）
+                self.failStreak++;
+                NSInteger wait = MIN(8, (NSInteger)pow(2, MIN(self.failStreak, 3)));
+                self.nextRebuildTick = self.diagTick + wait;
+                [self log:@"[看门狗] 重建失败(连续%ld次) → 退避%ld个周期后再试",
+                      (long)self.failStreak, (long)wait];
+            }
+            return;
+        }
     }
-    self.lastCallbackCount = cb;
 
     if (!eng.isRecording) { [self log:@"[实时] 未录音(自动开关关闭)"]; return; }
     float mic = 0, app = 0, sys = 0;
     [eng consumeAutoLevelsMic:&mic app:&app sys:&sys];
-    [self log:@"[实时] mic=%.4f 回调=%ld 常驻=Y 段=%ld 段内%.1f秒 %@", mic, (long)cb,
+    // v9.7 两路分开显示：-2 是主路(通话声音在这里)，-3 是副路(自己)
+    [self log:@"[实时] 主路-2=%.4f 副路-3=%.4f 回调 主%ld/副%ld | 段=%ld 段内%.1f秒 %@",
+          sys, mic,
+          (long)[eng sysCallbackCount], (long)[eng micCallbackCount],
           (long)[eng currentSegmentIndex], [eng currentSegmentSeconds],
-          mic > 0.01 ? @"★有声音" : @"(静音/环境音)"];
+          (sys > 0.01 || mic > 0.01) ? @"★有声音" : @"(静音/环境音)"];
+    if (![eng sysChannelAlive]) [self log:@"[实时] ⚠ 主路 -2 没建起来，本次录音只有麦克风"];
 
     if (self.diagTick % 24 == 0) [self cleanupOldSegments];
 }
@@ -244,6 +282,7 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
         (AVAudioSessionInterruptionType)[info[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
     if (type == AVAudioSessionInterruptionTypeBegan) {
         self.interrupted = YES;
+        self.interruptBeganAt = [NSDate date];
         [self log:@"[中断] ⚠ 系统音频被占用（来电/语音/Siri）→ 暂停看门狗，保住在录的段"];
     } else {
         self.interrupted = NO;
@@ -251,15 +290,22 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
         BOOL shouldResume = NO;
         NSNumber *opt = info[AVAudioSessionInterruptionOptionKey];
         if (opt) shouldResume = ([opt unsignedIntegerValue] & AVAudioSessionInterruptionOptionShouldResume) != 0;
-        [self log:@"[中断] ✅ 中断结束(shouldResume=%d) → 立即恢复常驻录音", shouldResume];
+        NSTimeInterval dur = self.interruptBeganAt ? [[NSDate date] timeIntervalSinceDate:self.interruptBeganAt] : 0;
+        [self log:@"[中断] ✅ 中断结束(shouldResume=%d, 持续%.0f秒) → 重建常驻录音", shouldResume, dur];
         if (self.thirdPartyAutoEnabled) {
-            if (eng.isRecording && [eng callbackCount] > 0) {
-                [self log:@"[中断] 队列仍在，继续使用（回调=%ld）", (long)[eng callbackCount]];
-            } else {
-                if (eng.isRecording) [eng stop];
-                self.lastCallbackCount = 0;
-                [self startContinuousRecording];
+            // ★v9.7 决定性修复：中断期间 iOS 会把 AudioQueue 置为「已暂停」，
+            // 中断结束后【必须重新 AudioQueueStart】否则队列永久不回调。
+            // 旧版在这里写的是「队列仍在，继续使用（回调=N）」然后什么都不做 ——
+            // 真机日志里回调数从 35 到 35 到 35 一动不动，整通电话一个字节都没录到。
+            // 更糟的是：tap 通道的 AudioQueue 一旦被中断暂停，几乎不可能"恢复原队列"，
+            // 唯一可靠做法是整条重建（全新 queue + 全新 tap）。
+            if (eng.isRecording) {
+                [self log:@"[中断] 队列已被系统暂停 → 停止并重建（旧队列不会再回调）"];
+                [eng stop];
             }
+            self.lastCallbackCount = 0;
+            // 立刻重建，不等看门狗 5 秒
+            [self startContinuousRecording];
         }
     }
 }
@@ -267,8 +313,13 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 #pragma mark - 持续录音控制
 
 - (void)startContinuousRecording {
+    (void)[self startContinuousRecordingReturningOK];
+}
+
+// v9.7：需要知道成功与否，用于看门狗退避
+- (BOOL)startContinuousRecordingReturningOK {
     RecorderEngine *eng = [RecorderEngine shared];
-    if (eng.isRecording) return;   // 单队列常驻，绝不重复启动
+    if (eng.isRecording) return YES;   // 单队列常驻，绝不重复启动
 
     NSDateFormatter *fmt = [NSDateFormatter new]; fmt.dateFormat = @"yyyyMMdd_HHmmss";
     NSString *name = [NSString stringWithFormat:@"rec_%@.wav", [fmt stringFromDate:[NSDate date]]];
@@ -278,19 +329,21 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
     NSError *err = nil;
     BOOL ok = [eng startContinuousWithFileURL:url error:&err];
     self.lastCallbackCount = 0;
-    [self log:@"▶ 常驻录音启动=%@ %@ | 单队列/单会话全程不重启, 每60秒滚动出一个WAV (基础名 %@)",
+    [self log:@"▶ 常驻录音启动=%@ %@ | 主路=-2系统输出 副路=-3麦克风 (与v6.0同配方, 不激活会话) (基础名 %@)",
           ok ? @"成功" : @"失败", err.localizedDescription ?: @"", name];
+    return ok;
 }
 
-// v9.6：确保常驻录音在跑。任何"可能把引擎掐断"的路径（播放录音、来电、
-// 系统中断、切前后台）结束后都调它，而不是各自去判断。
+// v9.7 语义变化：v9.7 走私有 tap，不激活会话，所以「系统中断」对我们的采集影响很小。
+// 但 tap 的 AudioQueue 被系统暂停后不会自己恢复，所以中断期间不主动重建（避免失败刷屏），
+// 中断结束由 onAudioInterrupted 立即重建。这里只在没有未处理中断时兜底拉起。
 - (void)ensureContinuousRecording {
     if (!self.thirdPartyAutoEnabled) return;
-    if (self.interrupted) return;      // 中断期间强行拉起只会失败
     RecorderEngine *eng = [RecorderEngine shared];
     if (eng.isRecording) return;
     [self log:@"[保障] 常驻录音不在跑 → 拉起重开"];
     self.lastCallbackCount = 0;
+    self.stallTicks = 0;
     [self startContinuousRecording];
 }
 

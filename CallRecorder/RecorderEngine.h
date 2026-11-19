@@ -46,6 +46,12 @@ typedef NS_ENUM(NSInteger, TRQuality) {
 - (BOOL)startContinuousWithFileURL:(NSURL *)fileURL error:(NSError **)error;
 // 看门狗用：采集回调累计次数（每 5 秒不增长即判为队列卡死）
 @property (nonatomic, readonly) NSInteger callbackCount;
+// v9.7 看门狗用主路(-2 系统输出)回调数判活，比两路之和更准确
+@property (nonatomic, readonly) NSInteger primaryCallbackCount;
+@property (nonatomic, readonly) NSInteger sysCallbackCount;   // -2 系统输出回调数（诊断）
+@property (nonatomic, readonly) NSInteger micCallbackCount;   // -3 麦克风回调数（诊断）
+@property (nonatomic, readonly) BOOL sysChannelAlive;         // -2 主路是否建起来了
+@property (nonatomic, readonly) BOOL micChannelAlive;         // -3 副路是否建起来了
 // v9.6 界面用：常驻录音「当前第几段」与「本段已录秒数」
 // （旧版界面完全不知道常驻录音在跑，按钮永远停在"开始录音"）
 // 返回 0 表示正在待机（还没检测到人声，磁盘上什么都没建）
@@ -55,6 +61,9 @@ typedef NS_ENUM(NSInteger, TRQuality) {
 - (NSInteger)sealedSegmentCount;
 // 界面专用麦克风电平（自带衰减，不受看门狗清零影响）
 - (float)uiMicLevel;
+// v9.7 界面专用：主路(-2 系统输出) / 副路(-3 麦克风) 各自电平，自带衰减
+- (float)uiSystemLevel;
+- (float)uiMicOnlyLevel;
 @property (nonatomic, readonly) float appLevel;      // 对方路(app-tap)电平
 @property (nonatomic, readonly) float systemLevel;   // 系统混音(-2)监测电平（诊断用）
 @property (nonatomic, readonly) BOOL  appTapActive;  // 是否成功用上真实 PID tap

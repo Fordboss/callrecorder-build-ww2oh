@@ -96,7 +96,12 @@
                 @"待命中：没有通话就不产生任何文件 · 已封存 %ld 段", (long)[e sealedSegmentCount]];
         }
         self.recordButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-        self.levelLabel.text = [NSString stringWithFormat:@"自己 %@ | 对方 未启用", [self bar:[e uiMicLevel]]];
+        // v9.7：两路分别显示，能直接看出主路(-2 系统输出)有没有收到声音
+        self.levelLabel.text = [NSString stringWithFormat:@"主路 %@ | 自己 %@",
+                                [self bar:[e uiSystemLevel]], [self bar:[e uiMicOnlyLevel]]];
+        if (![e sysChannelAlive]) {
+            self.statusLabel.text = @"⚠ 系统输出通道没建起来，本次只能录到自己";
+        }
     } else {
         [self.recordButton setTitle:@"⚠ 常驻录音已停 · 重建中" forState:UIControlStateNormal];
         self.recordButton.backgroundColor = [UIColor systemOrangeColor];
@@ -237,7 +242,7 @@
     // 微信通话自动录音（需先注入 WeChatCallHook.dylib 到微信）
     UILabel *wxLbl = [[UILabel alloc] init];
     wxLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    wxLbl.text = @"③ 微信/QQ自动录音（v9.6 常驻·界面同步·断话即封存）";
+    wxLbl.text = @"③ 微信/QQ自动录音（v9.7 双tap·与v6.0同配方）";
     wxLbl.font = [UIFont systemFontOfSize:13];
     [self.view addSubview:wxLbl];
     UISwitch *wxSw = [[UISwitch alloc] init];
@@ -351,9 +356,9 @@
     [self syncResidentUI];
     [self loadFiles];
     [self alert:sw.on
-        ? @"已开启【v9.6 常驻自动录音】：装上即用，无需注入、无需脱壳。\n\n★你反馈的「通话时能看到开始录音在动、微信/QQ 过一会有文件但录音按钮不动」——根因是界面和常驻录音完全脱节：常驻录音由后台自己启的，从不经过界面，按钮文案/电平条只在手动点按钮成功后才被设置，所以它永远停在「● 开始录音」。本版界面 0.5 秒跟随一次，按钮直接显示「常驻录音中 第N段 mm:ss」。\n\n★「时零时不灵 / 挂了没文件」的第二根因：原来只按满 60 秒封存，一段 30 秒的通话打完还留在 .part 里不落地；而且来电/语音时系统会中断采集队列，看门狗误判卡死并每 5 秒盲目重建。本版：① 说完话后连续静音 15 秒即封存落地；② 监听系统音频中断，中断期间不重建、中断结束立刻恢复。\n\n整段全程静音（没打任何通话）的段会被丢弃，不再在列表里堆垃圾文件。"
+        ? @"已开启【v9.7 自动录音】：装上即用，无需注入、无需脱壳。\n\n★这一版是回到 v6.0 的录音配方。你反馈「6.0 能自动录，现在都不能拉起」，我回去对比了 v6.0 的源码，找到唯一的结构性差异：\n\nv6.0 用【私有 tap】：-2 系统输出 + -3 麦克风，两条 AudioQueue 直接接 tap，全程【不激活 AVAudioSession】。\n\nv9.4 之后改成了【标准麦克风队列 + setActive:YES + PlayAndRecord】——这等于主动向系统申请录音会话。微信/QQ 通话一接通就把这个会话整个抢走，我们的队列立刻收到 Start='!pri'（无法启动），回调数永远停在原地，所以通话期间一个字节都录不到。\n\nv9.7 恢复 tap 配方：主路 -2 系统输出负责出文件（通话中对方声音在这里），副路 -3 麦克风只测电平不出文件（避免两个文件分不清）。全程不碰 AVAudioSession。\n\n另外还修了两处：① 中断结束后必须重建队列（旧版只打了一句“队列仍在，继续使用”，队列从此永久不回调）；② 发声判定从“逐采样比门限”改成“0.1秒块能量”，旧判定因为人声波形过零点大量漏检，会出现“明明有声音却永远不建文件”。"
         : @"已关闭自动录音，当前段已封存为可播放的 WAV。"
-          title:@"v9.6 自动录音"];
+          title:@"v9.7 自动录音"];
 }
 
 // 悬浮球开关（TrollStore 权限下可浮在微信/QQ 之上）
@@ -562,19 +567,14 @@
         [self restoreRecordSession];   // ★v9.6 不能 deactivate，否则常驻录音被掐断
         [t reloadData]; return;
     }
-    // v9.6 ★第二个关键修复（用户反馈「点击播放声音很小、像不是从扬声器出来」）：
-    // 常驻录音一直占着 PlayAndRecord，输出默认停在【听筒】。
-    // 而且绝对不能为了播放去 setCategory/Playback —— 切换 category 会打断采集队列，
-    // 播放一下就把正在跑的通话录音掐死了。正确做法：会话保持不变，只把输出路由改到扬声器。
+    // v9.7 ★播放策略随通道方案一起改：
+    // v9.7 的录音走私有 tap，全程【不激活 AVAudioSession】（和 v6.0 一致）。
+    // 所以播放时反而必须自己把会话激活成 Playback + 扬声器，否则听筒/静音键会吞掉声音。
+    // 播完立刻 setActive:NO 把会话还给系统 —— tap 不依赖会话，关掉不影响采集。
     AVAudioSession *sess = [AVAudioSession sharedInstance];
-    if ([self autoModeOn]) {
-        // 常驻模式：会话已经是 active 的 PlayAndRecord，只切输出口
-        [sess overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:nil];
-    } else {
-        [sess setCategory:AVAudioSessionCategoryPlayback error:nil];
-        [sess setActive:YES error:nil];
-        [sess overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:nil];
-    }
+    [sess setCategory:AVAudioSessionCategoryPlayback error:nil];
+    [sess setActive:YES error:nil];
+    [sess overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker error:nil];
     NSError *error = nil;
     AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithContentsOfURL:self.files[ip.row] error:&error];
     if (!p) { [self restoreRecordSession]; [self alert:error.localizedDescription ?: @"文件可能为空" title:@"播放失败"]; return; }
@@ -589,16 +589,13 @@
     self.player = p; self.playingIndex = ip.row; [t reloadData];
 }
 
-// v9.6 ★播放结束后把输出路由恢复，但绝不 setActive:NO
-// （旧版 setActive:NO 会把常驻录音的采集队列掐死 —— 「时零时不灵」的来源之一）
+// v9.7 ★播完把会话彻底还给系统。
+// v9.7 的录音是私有 tap（不激活会话），这里 setActive:NO 完全不影响采集；
+// 反而一直占着 Playback 会干扰微信/QQ 通话本身的音频路由。
 - (void)restoreRecordSession {
     AVAudioSession *sess = [AVAudioSession sharedInstance];
     [sess overrideOutputAudioPort:AVAudioSessionPortOverrideNone error:nil];
-    if ([self autoModeOn]) {
-        [[AppCallMonitor shared] ensureContinuousRecording];
-    } else {
-        [sess setActive:NO error:nil];
-    }
+    [sess setActive:NO error:nil];
 }
 - (BOOL)tableView:(UITableView *)t canEditRowAtIndexPath:(NSIndexPath *)ip { return YES; }
 - (void)tableView:(UITableView *)t commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndexPath *)ip {

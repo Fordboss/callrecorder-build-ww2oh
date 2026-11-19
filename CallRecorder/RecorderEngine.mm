@@ -320,6 +320,7 @@ static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, UInt64
     BOOL _autoMode;
     BOOL _appTapActive;
 }
+- (CaptureChannel *)primaryChannel;   // v9.7 前置声明：primaryCallbackCount 先用后定义
 @end
 
 @implementation RecorderEngine
@@ -444,7 +445,16 @@ static void CRWavRollIfNeeded(CaptureChannel *ch) {
     else if (talkEnded)  CRWavSeal(ch, @"说话结束静音15秒");
 }
 
-static const SInt16 kSoundGatePCM = 700;   // -33 dBFS：人声门限，环境底噪/空调声过不去
+// v9.7 ★门限重做：旧版 kSoundGatePCM=700 有两个毛病：
+//   1. 判 "loud" 用的是「单采样绝对值超门限」。人声/音乐都是振荡波形，
+//      大量采样在过零点附近必然低于门限 —— 逐采样判定的漏检率极高，
+//      真机日志里就是「mic 明明有 0.066 的峰值，却一直段=0 不建文件」。
+//   2. tap 送来的电平量级和普通麦克风不同，同一阈值两边表现不一致。
+// 改成：按 0.1 秒块算「块内均值绝对值」，≥ -46 dBFS(≈520/32767) 算有声块。
+// 均值反映的是这一块的音频能量，不受过零点影响，稳得多。
+static const SInt16 kSoundGatePCM = 520;   // -46 dBFS：块能量门限（不是单采样门限）
+// 触发所需的连续有声块数：0.1s × 5 = 0.5 秒（原来 0.6 秒，稍放宽）
+static const UInt32 kSoundRunBlocks = 5;
 
 // 打开一个新的 .wav.part 开始正式录；withPreroll=YES 时把触发前的 2 秒预录补进去
 static void CRWavOpenPart(CaptureChannel *ch, BOOL withPreroll) {
@@ -480,25 +490,34 @@ static void CRWavOpenPart(CaptureChannel *ch, BOOL withPreroll) {
 // 一个 1 kHz 的话音在每个过零点附近都低于门限。必须按「时间块」统计：
 // 一个 0.1 秒的块里有 ≥30% 的采样超过门限，才算这块"有声"，
 // 连续 6 个这样的块（≈0.6 秒）才认定真的在说话。
+// v9.7 ★重新设计「有没有人在说话」的判定（旧版是这里出的 bug）
+// 旧版错误：拿每个采样跟门限比，只要这个采样超过门限就算 loud。
+//   人声/音乐是振荡波形，一半以上的采样在过零点附近天然低于门限，
+//   于是「连续 6 个块里每块 ≥30% 采样超门限」这个条件极难满足 ——
+//   真机日志实锤：mic 峰值都到 0.0666 了，段号仍是 0，一个文件都没建。
+// 新做法：按 0.1 秒分块，累加块内 |样本| 的均值（= 这一块的能量），
+//   块均值 ≥ kSoundGatePCM 就算「有声块」，连续 kSoundRunBlocks 块就落盘。
+//   能量判据不受过零点影响，也不会被单次咔哒声误触发（要连续 0.5 秒）。
 static void CRWavFeed(CaptureChannel *ch, SInt16 pcm, BOOL loud) {
+    (void)loud;   // 不再使用逐采样判定（保留参数兼容调用点）
     if (ch->wavLazy && !ch->wav) {
-        // ===== 待机：只维护 2 秒预录环形缓冲 + 人声检测，磁盘上什么都没建 =====
+        // ===== 待机：只维护 2 秒预录环形缓冲 + 能量检测，磁盘上什么都没建 =====
         if (ch->preroll) {
             ch->preroll[ch->prerollPos] = pcm;
             ch->prerollPos = (ch->prerollPos + 1) % ch->prerollCap;
             if (ch->prerollCount < ch->prerollCap) ch->prerollCount++;
         }
-        // 按 0.1 秒分块统计有声比例
+        // 块内累加绝对值和，用来算这一块的平均能量
         ch->gateBlockN++;
-        if (loud) ch->gateLoudN++;
+        ch->gateLoudN += (UInt32)(pcm >= 0 ? pcm : -pcm);   // 复用 gateLoudN 存 |pcm| 累加
         if (ch->gateBlockN >= (UInt32)(0.1 * ch->wavRate)) {
-            BOOL blockLoud = (ch->gateLoudN * 10 >= ch->gateBlockN * 3);   // ≥30%
+            UInt32 meanAbs = ch->gateLoudN / (ch->gateBlockN ? ch->gateBlockN : 1);
+            BOOL blockLoud = (meanAbs >= (UInt32)kSoundGatePCM);
             ch->gateBlockN = 0; ch->gateLoudN = 0;
             if (blockLoud) {
                 ch->soundRun++;
-                // 连续 6 个有声块 ≈ 0.6 秒：排除咳嗽、关门、桌面碰撞等瞬时噪声
-                if (ch->soundRun >= 6) {
-                    CRWavOpenPart(ch, YES);
+                if (ch->soundRun >= kSoundRunBlocks) {
+                    CRWavOpenPart(ch, YES);   // 连续 0.5 秒能量够 → 开录
                 }
             } else {
                 ch->soundRun = 0;
@@ -507,9 +526,20 @@ static void CRWavFeed(CaptureChannel *ch, SInt16 pcm, BOOL loud) {
         return;
     }
     if (!ch->wav) return;
+    // ★v9.7 边界保护：开段瞬间 wavOutN 可能已经顶到 cap（回调循环只在入口判一次），
+    // 无保护会写出缓冲区 —— 表现是偶发崩溃 / 文件尾部噪声。
+    if (ch->wavOutN >= ch->wavScratchCap) return;
+    // 录音中：静音检测同样改用块能量，避免把正常通话误判成"说完了"
     ch->wavScratch[ch->wavOutN++] = pcm;
-    if (loud) { ch->wavHadSound = YES; ch->wavSilentFrames = 0; }
-    else ch->wavSilentFrames++;
+    ch->gateBlockN++;
+    ch->gateLoudN += (UInt32)(pcm >= 0 ? pcm : -pcm);
+    if (ch->gateBlockN >= (UInt32)(0.1 * ch->wavRate)) {
+        UInt32 meanAbs = ch->gateLoudN / (ch->gateBlockN ? ch->gateBlockN : 1);
+        BOOL blockLoud = (meanAbs >= (UInt32)kSoundGatePCM);
+        ch->gateBlockN = 0; ch->gateLoudN = 0;
+        if (blockLoud) { ch->wavHadSound = YES; ch->wavSilentFrames = 0; }
+        else ch->wavSilentFrames += (UInt32)(0.1 * ch->wavRate);
+    }
 }
 
 static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef buffer,
@@ -873,39 +903,132 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     _micURL = nil; _spkURL = nil; _appURL = nil; _sysURL = nil;
     _appWavURL = nil; _sysWavURL = nil;
     UInt32 down = (_quality == TRQualityHigh) ? 1 : ((_quality == TRQualityNormal) ? 2 : 4);
-    _mic = [self startAutoMicWithWavURL:fileURL down:down error:error];
-    if (!_mic) { [self fail:@"常驻麦克风启动失败" error:error]; return NO; }
+
+    NSString *stem = [[fileURL lastPathComponent] stringByDeletingPathExtension];
+    NSURL *dir = [fileURL URLByDeletingLastPathComponent];
+    NSURL *micURL = [dir URLByAppendingPathComponent:[stem stringByAppendingString:@"_mic.wav"]];
+    _micURL = micURL;
+    UInt64 rollFrames = (UInt64)(60.0 * kTapSampleRate / down);
+
+    // ================= v9.7 ★回归 v6.0 配方（用户实测 v6.0 通话能自动录音）=================
+    // v6.0 能录、v9.4 之后不能录的唯一结构性差异：
+    //   v6.0  纯私有 tap（-3 麦克风 + -2 系统输出）+ flag 0x800 + qtob，
+    //         【全程不激活 AVAudioSession】，靠 entitlements 的
+    //         com.apple.coreaudio.CanRecordWithoutSessionActivation 直接取流；
+    //   v9.4+ 改成「标准麦克风 AudioQueue + setActive:YES + PlayAndRecord」。
+    //         一旦激活会话，微信/QQ 通话就会把会话整个抢走 → Start='!pri',
+    //         回调恒为 0 → 通话期间彻底录不到（就是现在的病症）。
+    // 因此这里恢复 tap 方案，并且【绝不激活 AVAudioSession】。
+    // =====================================================================================
+
+    // 主路：-2 系统输出（通话中对方声音 + 被系统混进输出的本方声音）
+    _sys = [self startChannelWithPID:kATAudioTapDescriptionPIDSpeaker channels:2
+                             fileURL:nil error:nil];
+    if (_sys) {
+        if (![self attachWavOutput:fileURL toChannel:_sys down:down rollFrames:rollFrames]) {
+            CRAppLog(@"[常驻] 主路WAV挂接失败 → 放弃系统输出主路");
+            [self stopChannel:_sys]; _sys = nil;
+        }
+    } else {
+        CRAppLog(@"[常驻] ⚠ 系统输出tap(-2) 创建失败");
+    }
+
+    // 副路：-3 麦克风。★v9.7 只做电平监测，不单独出文件 ——
+    // 出两份文件会让用户分不清哪个是通话录音（之前"一堆文件"的抱怨）。
+    // 主路(-2)活着时麦克风不写盘；只有主路失败才把文件给它。
+    BOOL micOwnsFile = (_sys == nil);
+    _mic = [self startChannelWithPID:kATAudioTapDescriptionPIDMicrophone channels:1
+                             fileURL:nil error:nil];
+    if (_mic) {
+        if (micOwnsFile) {
+            if (![self attachWavOutput:micURL toChannel:_mic down:down rollFrames:rollFrames]) {
+                [self stopChannel:_mic]; _mic = nil;
+            }
+        }
+    } else {
+        CRAppLog(@"[常驻] ⚠ 麦克风tap(-3) 创建失败");
+    }
+
+    if (!_sys && !_mic) {
+        // 最后兜底：标准麦克风队列（只在两个 tap 都起不来时用，通话中大概率录不到）
+        CRAppLog(@"[常驻] ⚠ 两路 tap 都失败 → 兜底标准麦克风队列");
+        _mic = [self startAutoMicWithWavURL:micURL down:down error:nil];
+        if (!_mic) { [self fail:@"三路都起不来" error:error]; return NO; }
+    }
     _recording = YES;
-    CRAppLog(@"[常驻] v9.6 启动OK | 待机不建文件, 检测到人声才落盘; 说完静音15秒封存; 基础名=%@",
-             fileURL.lastPathComponent);
+    CRAppLog(@"[常驻] v9.7 启动OK | 主路=-2系统输出(出文件)=%@ 副路=-3麦克风(仅电平)=%@ | 不激活会话(与v6.0一致) | 文件=%@",
+             _sys ? @"OK" : @"FAIL", _mic ? @"OK" : @"FAIL", stem);
     return YES;
 }
 
-- (NSInteger)callbackCount { return _mic ? _mic->callbacks : 0; }
+// 看门狗用：两路回调数之和（任一路在推流就不算卡死）
+- (NSInteger)callbackCount {
+    NSInteger c = 0;
+    if (_mic) c += _mic->callbacks;
+    if (_sys) c += _sys->callbacks;
+    return c;
+}
+// v9.7 看门狗用「主路回调数」判活：只要主路(-2)还在推流就算健康。
+// 不能用两路之和 —— 麦克风那路就算活着，也不能证明通话声音录到了。
+- (NSInteger)primaryCallbackCount {
+    CaptureChannel *ch = [self primaryChannel];
+    return ch ? ch->callbacks : 0;
+}
+// 诊断用：分别看两路各自回调
+- (NSInteger)sysCallbackCount { return _sys ? _sys->callbacks : 0; }
+- (NSInteger)micCallbackCount { return _mic ? _mic->callbacks : 0; }
+- (BOOL)sysChannelAlive { return _sys != NULL; }
+- (BOOL)micChannelAlive { return _mic != NULL; }
 
 // v9.6 界面同步：让界面能读到常驻录音的实时进度。
 // 旧版界面只在「手动点按钮成功」时才会把按钮改成"停止录音"并启动电平定时器，
 // 而常驻录音是 AppCallMonitor 自己启的，界面完全不知道 → 用户看到"有文件但按钮没动"。
+// v9.7：「当前正在录的那一路」= 主路(-2 系统输出) 优先，没有就退回副路(-3 麦克风)。
+// 旧版全部硬读 _mic —— 而 v9.7 的主路是 _sys，界面就会永远显示"待机 0 段"。
+- (CaptureChannel *)primaryChannel {
+    if (_sys && _sys->wavRolling) return _sys;
+    if (_mic && _mic->wavRolling) return _mic;
+    return _sys ?: _mic;
+}
+
 - (NSInteger)currentSegmentIndex {
-    if (!_mic || !_mic->wavRolling) return 0;
-    return _mic->wav ? _mic->wavPart : 0;   // 0 = 待机中（还没检测到人声，没建文件）
+    CaptureChannel *ch = [self primaryChannel];
+    if (!ch || !ch->wavRolling) return 0;
+    return ch->wav ? ch->wavPart : 0;   // 0 = 待机中（还没检测到人声，没建文件）
 }
 - (double)currentSegmentSeconds {
-    if (!_mic || _mic->wavRate == 0 || !_mic->wav) return 0;
-    return (double)_mic->wavFrames / (double)_mic->wavRate;
+    CaptureChannel *ch = [self primaryChannel];
+    if (!ch || ch->wavRate == 0 || !ch->wav) return 0;
+    return (double)ch->wavFrames / (double)ch->wavRate;
 }
 - (NSInteger)sealedSegmentCount {
-    if (!_mic || !_mic->wavRolling) return 0;
-    return _mic->wavPart - 1;
+    CaptureChannel *ch = [self primaryChannel];
+    if (!ch || !ch->wavRolling) return 0;
+    return ch->wavPart - 1;
 }
 
 // v9.6 界面电平：取「界面专用峰值」后衰减一半。
 // 不能直接用 micLevel —— 那个 peak 被看门狗每 5 秒 consumeAutoLevelsMic 清零，
 // 界面 0.5 秒读一次会读到大量 0，表现为电平条忽亮忽灭、看着像没在录。
 - (float)uiMicLevel {
+    CaptureChannel *ch = [self primaryChannel];
+    if (!ch) return 0;
+    float v = ch->uiPeak;
+    ch->uiPeak = v * 0.5f;    // 每 tick 衰减，形成自然的电平条回弹
+    return v;
+}
+// v9.7 界面用：主路(-2 系统输出)专用电平，同样自带衰减
+- (float)uiSystemLevel {
+    if (!_sys) return 0;
+    float v = _sys->uiPeak;
+    _sys->uiPeak = v * 0.5f;
+    return v;
+}
+// v9.7 界面用：副路(-3 麦克风)专用电平
+- (float)uiMicOnlyLevel {
     if (!_mic) return 0;
     float v = _mic->uiPeak;
-    _mic->uiPeak = v * 0.5f;    // 每 tick 衰减，形成自然的电平条回弹
+    _mic->uiPeak = v * 0.5f;
     return v;
 }
 
@@ -1001,13 +1124,16 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     NSFileManager *fm = [NSFileManager defaultManager];
     (void)fm; (void)MixCAFs; (void)SampleRateForQuality;   // 旧链路保留但不再调用，避免未使用告警
 
-    // ============ v9.5 自动常驻模式：只做收尾，不做任何混音/择优 ============
+    // ============ v9.7 自动常驻模式：只做收尾，不做任何混音/择优 ============
     if (_autoMode) {
-        // 只有「用户关闭自动开关 / App 退出」才会走到这里，整段运行期间会话一直 active
-        [[AVAudioSession sharedInstance] setActive:NO error:nil];
-        CRAppLog(@"[停止] 常驻录音结束 | 回调=%d 累计字节=%llu 峰值Ever=%.4f | 已封存%d段WAV | 待机时长内未产生文件是正常的",
-                 _mic ? _mic->callbacks : 0, _mic ? _mic->totalBytes : 0,
-                 _mic ? _mic->peakEver : 0, _mic ? (_mic->wavPart - 1) : 0);
+        // ★v9.7：这里不再 setActive:NO —— v9.7 用私有 tap，全程没激活过会话，
+        // 强行 deactivate 反而会通知系统"我不用音频了"，让微信/QQ 更容易抢走路由。
+        // 与 v6.0 行为一致：不碰 AVAudioSession。
+        NSInteger sealed = 0;
+        if (_sys && _sys->wavRolling) sealed += (_sys->wavPart - 1);
+        if (_mic && _mic->wavRolling) sealed += (_mic->wavPart - 1);
+        CRAppLog(@"[停止] 常驻录音结束 | 主路-2回调=%d 副路-3回调=%d | 已封存%ld段WAV | 待机期间无文件属正常",
+                 _sys ? _sys->callbacks : 0, _mic ? _mic->callbacks : 0, (long)sealed);
         dispatch_async(dispatch_get_main_queue(), ^{
             [[NSNotificationCenter defaultCenter] postNotificationName:@"CallRecorderSegmentRolled" object:nil];
         });
