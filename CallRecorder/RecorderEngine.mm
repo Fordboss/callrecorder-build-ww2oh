@@ -424,10 +424,10 @@ static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, UInt64
 //   1. 检测到人声 → 建一个 .wav（不再用 .part 后缀），之后【始终往同一个文件追加】；
 //   2. 文件头每 2 秒回填一次数据长度，所以磁盘上的文件从一开始就是「可直接播放」的成品，
 //      挂断 2 秒后列表里就有、点开就能听，不需要等"封存"这个动作；
-//   3. 「这通结束」的唯一判据：连续静音 300 秒（5 分钟）→ 关闭文件、回到待机；
+//   3. 「这通结束」的唯一判据：连续静音 60 秒（1 分钟）→ 关闭文件、回到待机；
 //      一通电话里的各种几十秒停顿完全不会切段；
 //   4. 硬上限 6 小时，防止长时间不关导致单文件无限增长。
-static const NSTimeInterval kIdleCloseSeconds = 300.0;   // 静音 5 分钟 → 判定这一通结束
+static const NSTimeInterval kIdleCloseSeconds = 60.0;    // v9.9 静音 60 秒 → 判定这一通结束（原 300 秒）
 static const NSTimeInterval kHeaderTouchSecs  = 2.0;     // 每 2 秒回填一次 WAV 头
 static const NSTimeInterval kMaxOneFileHours  = 6.0;     // 单文件硬上限
 
@@ -480,13 +480,13 @@ static void CRWavSeal(CaptureChannel *ch, NSString *reason) {
 // v9.8：只判「这一通有没有结束」，不再按 60 秒 / 15 秒切段。
 static void CRWavRollIfNeeded(CaptureChannel *ch) {
     if (!ch || !ch->wav || !ch->wavRolling || ch->wavRate == 0) return;
-    // 连续静音 5 分钟 → 这一通结束
+    // 连续静音 60 秒 → 这一通结束
     BOOL idleEnded = (ch->wavSilentFrames >= (UInt64)(kIdleCloseSeconds * ch->wavRate));
     // 单文件硬上限（6 小时）
     UInt64 maxFrames = (UInt64)(kMaxOneFileHours * 3600.0 * ch->wavRate);
     BOOL tooBig = (maxFrames > 0 && ch->wavFrames >= maxFrames);
     if (tooBig)          CRWavSeal(ch, @"单文件达6小时上限");
-    else if (idleEnded)  CRWavSeal(ch, @"静音满5分钟，判定这一通已结束");
+    else if (idleEnded)  CRWavSeal(ch, @"静音满60秒，判定这一通已结束");
 }
 
 // v9.7 ★门限重做：旧版 kSoundGatePCM=700 有两个毛病：
@@ -703,7 +703,7 @@ static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef bu
             ch->wavFrames += outN;
         }
         CRWavTouchHeader(ch);    // v9.8：每 2 秒回填头，正在写的文件随时可播放
-        CRWavRollIfNeeded(ch);   // v9.8：只判"静音满5分钟/超6小时"，不按 60 秒切段
+        CRWavRollIfNeeded(ch);   // v9.9：只判"静音满60秒/超6小时"，不按时间切段
     }
     ch->totalBytes += buffer->mAudioDataByteSize;
     ch->callbacks++;
@@ -858,7 +858,7 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
         snprintf(ch->wavStem, sizeof(ch->wavStem), "%s", stem.UTF8String);
         ch->wavPart = 1;
         // ★v9.8：wavRollFrames 不再当"每 60 秒切段"用，CRWavRollIfNeeded 只用
-        // "静音 5 分钟 / 单文件 6 小时"两个条件关文件，所以这里不再设 60 秒阈值。
+        // "静音 60 秒 / 单文件 6 小时"两个条件关文件，所以这里不再设滚动切段阈值。
         ch->wavRollFrames = 0;
         ch->wavRolling = YES;
         ch->wavLazy = YES;

@@ -39,8 +39,8 @@
 
 static NSString * const kThirdPartyAutoKey = @"CallRecorderThirdPartyAuto";
 static NSString * const kLogName = @"appcall_monitor.log";
-// v9.8：不再按时间切段 —— 一通电话从头到尾一个文件，静音 5 分钟才算这一通结束
-static const NSTimeInterval kIdleCloseSeconds = 300.0;
+// v9.9：不再按时间切段 —— 一通电话从头到尾一个文件。
+// 收尾判据（静音 60 秒）在 RecorderEngine 的 CRWavRollIfNeeded 里，这里只保留注释说明。
 static const NSInteger kKeepSegments = 30;            // 保留最近30个通话文件
 static const unsigned long long kMaxTotalBytes = 3ULL * 1024 * 1024 * 1024;  // 总量上限 3GB
 
@@ -157,15 +157,15 @@ static NSString *PIDSignature(NSArray<NSNumber *> *pids) {
 #pragma mark - 启动
 
 - (void)start {
-    [self log:@"===== 常驻录音 v9.8 (双tap + 一通电话一个文件) 启动 ====="];
+    [self log:@"===== 常驻录音 v9.9 (双tap + 一通电话一个文件, 静音60秒收尾) 启动 ====="];
     [self log:@"★关键: v6.0 能自动录音 / v9.4~v9.6 不能，唯一差异是录音通道"];
     [self log:@"★v6.0: 私有tap(-2系统输出 + -3麦克风), 全程不激活AVAudioSession"];
     [self log:@"★v9.4+: 标准麦克风队列 + setActive:YES → 微信/QQ通话把会话抢走, 回调恒为0"];
     [self log:@"★v9.7: 回到 v6.0 配方(双tap + 不激活会话), 主路-2出文件, 副路-3只测电平"];
-    [self log:@"★v9.8: 一通电话一个文件(边录边回填头, 随时可播), 静音5分钟才收尾, 不再60秒切段"];
+    [self log:@"★v9.9: 一通电话一个文件(边录边回填头, 随时可播), 静音60秒即收尾, 不按时间切段"];
     [self log:@"★另修: 中断结束后必须重建队列(旧版只打'队列仍在继续使用', 队列从此不回调)"];
     [self log:@"★另修: 发声判定改用0.1秒块能量(旧版逐采样比较, 人声过零点大量漏检→永不建文件)"];
-    [self log:@"不注入/不脱壳, 装上即用, 一通电话从头到尾一个WAV(静音5分钟收尾), 留最近%ld个", (long)kKeepSegments];
+    [self log:@"不注入/不脱壳, 装上即用, 一通电话从头到尾一个WAV(静音60秒收尾), 留最近%ld个", (long)kKeepSegments];
 
     NSArray<NSString *> *names = nil;
     NSArray<NSNumber *> *pids = FindCallAppPIDs(&names);
