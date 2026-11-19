@@ -4,6 +4,7 @@
 #import <UIKit/UIKit.h>
 #import <math.h>
 #import <stdio.h>
+#import <pthread.h>
 
 #import "ATAudioTap.h"
 #import "ATAudioTapDescription.h"
@@ -177,8 +178,20 @@ static BOOL CRMixWavToStereo(NSURL *aURL, NSURL *bURL, NSURL *outURL,
     UInt32                      prerollPos;
     UInt32                      soundRun;        // 连续有声块计数（防误触发）
     UInt32                      gateBlockN;      // 当前统计块内的样本数
-    UInt32                      gateLoudN;       // 当前统计块内超过门限的样本数
+    UInt32                      gateLoudN;       // 当前统计块内 |pcm| 累加
     UInt32                      wavOutN;         // 本次回调待写的样本数
+    // ===== v9.7 实时混音（对标 v6.0 的"两路合成一个文件"）=====
+    // v6.0 是录完再混成一个 m4a；常驻模式没有"录完"这个时刻，
+    // 所以改成边录边混：-3 麦克风的样本推给主路 -2 的内存环，主路写盘时叠加。
+    // 结果：一个文件里同时有对方(系统输出)和自己(麦克风)，和 v6.0 听感一致。
+    BOOL                        isMixSource;     // 本通道只当混音源，不出文件
+    __unsafe_unretained CaptureChannel *mixTarget;   // 混音目标（主路）
+    SInt16                     *mixRing;         // 待混入样本环（容量约 1 秒）
+    UInt32                      mixCap;
+    UInt32                      mixW;
+    UInt32                      mixR;
+    pthread_mutex_t             mixLock;
+    BOOL                        mixLockInit;
 }
 @end
 @implementation CaptureChannel
@@ -490,6 +503,33 @@ static void CRWavOpenPart(CaptureChannel *ch, BOOL withPreroll) {
 // 一个 1 kHz 的话音在每个过零点附近都低于门限。必须按「时间块」统计：
 // 一个 0.1 秒的块里有 ≥30% 的采样超过门限，才算这块"有声"，
 // 连续 6 个这样的块（≈0.6 秒）才认定真的在说话。
+// ===== v9.7 实时混音 helper =====
+// 副路(麦克风)的样本先进自己的环形缓冲；主路(系统输出)写盘时按顺序取出叠加。
+// 两路都是 44.1k→down 到同一采样率，帧数节奏基本一致；环形缓冲给 2 秒余量吸收抖动。
+static void CRMixPush(CaptureChannel *src, SInt16 pcm) {
+    if (!src || !src->mixRing) return;
+    if (src->mixLockInit) pthread_mutex_lock(&src->mixLock);
+    UInt32 next = (src->mixW + 1) % src->mixCap;
+    if (next != src->mixR) {            // 满了就丢最旧，绝不阻塞采集回调
+        src->mixRing[src->mixW] = pcm;
+        src->mixW = next;
+    }
+    if (src->mixLockInit) pthread_mutex_unlock(&src->mixLock);
+}
+
+// 从混音源取一个样本；没有就返回 0（不阻塞）
+static SInt16 CRMixPop(CaptureChannel *src) {
+    if (!src || !src->mixRing || !src->mixLockInit) return 0;
+    SInt16 v = 0;
+    pthread_mutex_lock(&src->mixLock);
+    if (src->mixR != src->mixW) {
+        v = src->mixRing[src->mixR];
+        src->mixR = (src->mixR + 1) % src->mixCap;
+    }
+    pthread_mutex_unlock(&src->mixLock);
+    return v;
+}
+
 // v9.7 ★重新设计「有没有人在说话」的判定（旧版是这里出的 bug）
 // 旧版错误：拿每个采样跟门限比，只要这个采样超过门限就算 loud。
 //   人声/音乐是振荡波形，一半以上的采样在过零点附近天然低于门限，
@@ -500,6 +540,13 @@ static void CRWavOpenPart(CaptureChannel *ch, BOOL withPreroll) {
 //   能量判据不受过零点影响，也不会被单次咔哒声误触发（要连续 0.5 秒）。
 static void CRWavFeed(CaptureChannel *ch, SInt16 pcm, BOOL loud) {
     (void)loud;   // 不再使用逐采样判定（保留参数兼容调用点）
+
+    // ===== v9.7 混音源通道（副路麦克风）：只往主路的混音环里塞，不自己出文件 =====
+    if (ch->isMixSource) {
+        CRMixPush(ch, pcm);
+        return;
+    }
+
     if (ch->wavLazy && !ch->wav) {
         // ===== 待机：只维护 2 秒预录环形缓冲 + 能量检测，磁盘上什么都没建 =====
         if (ch->preroll) {
@@ -529,6 +576,16 @@ static void CRWavFeed(CaptureChannel *ch, SInt16 pcm, BOOL loud) {
     // ★v9.7 边界保护：开段瞬间 wavOutN 可能已经顶到 cap（回调循环只在入口判一次），
     // 无保护会写出缓冲区 —— 表现是偶发崩溃 / 文件尾部噪声。
     if (ch->wavOutN >= ch->wavScratchCap) return;
+    // ===== v9.7 实时混音：主路(系统输出)写盘时，把副路(麦克风)的样本叠加进来 =====
+    // 这样最终一个文件里同时有对方和自己，和 v6.0 录完混音的效果一致。
+    if (ch->mixTarget) {
+        SInt16 other = CRMixPop(ch->mixTarget);
+        if (other != 0) {
+            NSInteger m = (NSInteger)pcm + (NSInteger)other;
+            if (m > 32767) m = 32767; else if (m < -32768) m = -32768;
+            pcm = (SInt16)m;
+        }
+    }
     // 录音中：静音检测同样改用块能量，避免把正常通话误判成"说完了"
     ch->wavScratch[ch->wavOutN++] = pcm;
     ch->gateBlockN++;
@@ -584,7 +641,7 @@ static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef bu
     // 不经过 AAC 编码器、不经过 CAF、不经过二次打开。回调有数据 → 文件里就必然有波形。
     // v9.6：待机（wavLazy 且 ch->wav 为 NULL）时也必须进这个分支 —— 
     // 正是这里在维护预录缓冲并检测人声，检测到才建文件。
-    if ((ch->wav || ch->wavLazy) && ch->format.mBytesPerFrame > 0) {
+    if ((ch->wav || ch->wavLazy || ch->isMixSource) && ch->format.mBytesPerFrame > 0) {
         UInt32 inCh = ch->format.mChannelsPerFrame ? ch->format.mChannelsPerFrame : 1;
         UInt32 frames = buffer->mAudioDataByteSize / ch->format.mBytesPerFrame;
         // 待机时没有 scratch 容量上限的概念（只进 preroll），所以要放开上限
@@ -933,20 +990,36 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
         CRAppLog(@"[常驻] ⚠ 系统输出tap(-2) 创建失败");
     }
 
-    // 副路：-3 麦克风。★v9.7 只做电平监测，不单独出文件 ——
-    // 出两份文件会让用户分不清哪个是通话录音（之前"一堆文件"的抱怨）。
-    // 主路(-2)活着时麦克风不写盘；只有主路失败才把文件给它。
-    BOOL micOwnsFile = (_sys == nil);
+    // 副路：-3 麦克风。★v9.7 只当【混音源】：样本进混音环，由主路写盘时叠加，
+    // 因此最终一个文件里既有对方(系统输出)也有自己(麦克风)，与 v6.0 听感一致。
+    // 自己单独出文件会让用户分不清哪个是通话录音（之前"一堆文件"的抱怨）。
     _mic = [self startChannelWithPID:kATAudioTapDescriptionPIDMicrophone channels:1
                              fileURL:nil error:nil];
-    if (_mic) {
-        if (micOwnsFile) {
-            if (![self attachWavOutput:micURL toChannel:_mic down:down rollFrames:rollFrames]) {
-                [self stopChannel:_mic]; _mic = nil;
-            }
+    if (_mic && _sys) {
+        // 建立混音连接：副路标成 mixSource 往环里塞，主路指向副路去取
+        _mic->isMixSource = YES;
+        // ★混音源也要有抽取参数，否则回调里 wavDown=0 会除零/不输出样本
+        _mic->wavDown = down;
+        _mic->wavRate = (UInt32)(kTapSampleRate / down);
+        _mic->mixCap = (UInt32)(2.0 * (kTapSampleRate / down)) + 1024;
+        _mic->mixRing = (SInt16 *)calloc(_mic->mixCap, sizeof(SInt16));
+        _mic->mixW = 0; _mic->mixR = 0;
+        if (_mic->mixRing) {
+            pthread_mutex_init(&_mic->mixLock, NULL);
+            _mic->mixLockInit = YES;
+            _sys->mixTarget = _mic;      // 主路写盘时从这里取样本叠加
+            CRAppLog(@"[混音] 实时混音已连接：-2 系统输出 + -3 麦克风 → 一个文件");
+        } else {
+            CRAppLog(@"[混音] 混音环分配失败，只录系统输出");
+            _mic->isMixSource = NO;
         }
-    } else {
-        CRAppLog(@"[常驻] ⚠ 麦克风tap(-3) 创建失败");
+    } else if (_mic && !_sys) {
+        // 主路没起来 → 麦克风自己出文件（总比没有好）
+        if (![self attachWavOutput:micURL toChannel:_mic down:down rollFrames:rollFrames]) {
+            [self stopChannel:_mic]; _mic = nil;
+        }
+    } else if (!_mic) {
+        CRAppLog(@"[常驻] ⚠ 麦克风tap(-3) 创建失败（只录系统输出，你自己说话可能听不到）");
     }
 
     if (!_sys && !_mic) {
@@ -1115,6 +1188,8 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
           _spk?_spk->callbacks:0, _spk?_spk->totalBytes:0, _spk?_spk->peak:0);
 
     // 先停队列（同步），再关 CAF 与直写 m4a，保证数据写全
+    // ★v9.7：先断开主路对副路混音环的引用，避免 _mic 先释放后 _sys 仍在回调里取野指针
+    if (_sys) _sys->mixTarget = nil;
     [self stopChannel:_mic];
     [self stopChannel:_spk];
     [self stopChannel:_app];
@@ -1184,6 +1259,12 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     if (ch->wavScratch) { free(ch->wavScratch); ch->wavScratch = NULL; }
     if (ch->preroll) { free(ch->preroll); ch->preroll = NULL; }
     ch->prerollCount = 0; ch->prerollPos = 0; ch->prerollCap = 0;
+    // v9.7 混音环释放（副路持有）
+    if (ch->mixRing) { free(ch->mixRing); ch->mixRing = NULL; }
+    if (ch->mixLockInit) { pthread_mutex_destroy(&ch->mixLock); ch->mixLockInit = NO; }
+    ch->mixW = 0; ch->mixR = 0; ch->mixCap = 0;
+    ch->mixTarget = nil;
+    ch->isMixSource = NO;
     ch->tap = nil;
 }
 
@@ -1191,12 +1272,20 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     CRLog(@"★%@", msg);
     if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:-1
                                        userInfo:@{NSLocalizedDescriptionKey:msg}];
+    // ★v9.7 顺序很重要：先把主路对副路混音环的引用断开，再停通道。
+    // 否则 _mic 的 mixRing 先被 free，而 _sys 的采集回调仍在运行并调用
+    // CRMixPop(_mic) → 野指针崩溃。这里先摘引用，再按原顺序停。
+    if (_sys) _sys->mixTarget = nil;
     [self stopChannel:_mic]; [self stopChannel:_spk];
     [self stopChannel:_app]; [self stopChannel:_sys];
     _mic = nil; _spk = nil; _app = nil; _sys = nil; _recording = NO;
 }
 
 - (void)cleanup {
+    // ★v9.7 顺序很重要：先把主路对副路混音环的引用断开，再停通道。
+    // 否则 _mic 的 mixRing 先被 free，而 _sys 的采集回调仍在运行并调用
+    // CRMixPop(_mic) → 野指针崩溃。这里先摘引用，再按原顺序停。
+    if (_sys) _sys->mixTarget = nil;
     [self stopChannel:_mic]; [self stopChannel:_spk];
     [self stopChannel:_app]; [self stopChannel:_sys];
     _mic = nil; _spk = nil; _app = nil; _sys = nil; _recording = NO;
