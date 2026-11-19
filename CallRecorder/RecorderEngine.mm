@@ -97,9 +97,6 @@ static void CRWavHeader(FILE *f, UInt32 rate, UInt16 channels) {
 static void CRWavFinalize(FILE *f, UInt64 frames, UInt16 channels) {
     if (!f) return;
     UInt64 dataBytes = frames * channels * 2;
-    // WAV(RIFF) 的长度字段是 32 位，超过 4GB 会溢出成非法文件。
-    // 单文件 6 小时上限在 44.1kHz 下约 1.9GB，正常不会到，这里只做最后一道保险。
-    if (dataBytes > 0xFFFFFFF0ULL) dataBytes = 0xFFFFFFF0ULL;
     if (fseek(f, 4, SEEK_SET) == 0)  CRPut32(f, (UInt32)(36 + dataBytes));
     if (fseek(f, 40, SEEK_SET) == 0) CRPut32(f, (UInt32)dataBytes);
     fflush(f);
@@ -183,7 +180,6 @@ static BOOL CRMixWavToStereo(NSURL *aURL, NSURL *bURL, NSURL *outURL,
     UInt32                      gateBlockN;      // 当前统计块内的样本数
     UInt32                      gateLoudN;       // 当前统计块内 |pcm| 累加
     UInt32                      wavOutN;         // 本次回调待写的样本数
-    UInt64                      wavLastHeaderFrames;  // v9.8 上次回填 WAV 头时的帧数（限频用）
     // ===== v9.7 实时混音（对标 v6.0 的"两路合成一个文件"）=====
     // v6.0 是录完再混成一个 m4a；常驻模式没有"录完"这个时刻，
     // 所以改成边录边混：-3 麦克风的样本推给主路 -2 的内存环，主路写盘时叠加。
@@ -417,52 +413,31 @@ static BOOL MixCAFs(NSURL *in1, NSURL *in2, NSURL *outURL, Float64 outSR, UInt64
 // 结果：没有通话就 0 个文件；真打电话就来一个能播的通话文件。
 // 全程静音必须不落地：WAV 是未压缩 PCM，11 kHz 单声道静音也要 1.3 MB/分钟，
 // 一天待机能攒出好几个 G。
-// ===== v9.8 ★「一通电话 = 一个文件」=====
-// v9.7 及以前：满 60 秒、或说完静音 15 秒就封存一段 ——
-// 一通 30 分钟的电话被切成 30 多个文件，用户回放时要一个个点，体验极差。
-// v9.8 起改为「单一连续文件」：
-//   1. 检测到人声 → 建一个 .wav（不再用 .part 后缀），之后【始终往同一个文件追加】；
-//   2. 文件头每 2 秒回填一次数据长度，所以磁盘上的文件从一开始就是「可直接播放」的成品，
-//      挂断 2 秒后列表里就有、点开就能听，不需要等"封存"这个动作；
-//   3. 「这通结束」的唯一判据：连续静音 60 秒（1 分钟）→ 关闭文件、回到待机；
-//      一通电话里的各种几十秒停顿完全不会切段；
-//   4. 硬上限 6 小时，防止长时间不关导致单文件无限增长。
-static const NSTimeInterval kIdleCloseSeconds = 60.0;    // v9.9 静音 60 秒 → 判定这一通结束（原 300 秒）
-static const NSTimeInterval kHeaderTouchSecs  = 2.0;     // 每 2 秒回填一次 WAV 头
-static const NSTimeInterval kMaxOneFileHours  = 6.0;     // 单文件硬上限
+// ★v9.10：「一通电话 = 一个文件」只改了这一处判定。
+// v9.7 之前有两个封存条件：满 60 秒（full）、说完静音 15 秒（talkEnded）。
+// 现在去掉 full，只保留「连续静音 60 秒」—— 一通电话里的停顿不会切段。
+// 注意：写盘方式、.part→.wav 改名、采集链路全部保持 v9.7 原样，不做边录边回填头。
+static const NSTimeInterval kIdleCloseSeconds = 60.0;   // 连续静音 60 秒 → 这一通结束
 
 // 前置声明（这些函数互相引用）
 static void CRWavOpenPart(CaptureChannel *ch, BOOL withPreroll);
 static void CRWavSeal(CaptureChannel *ch, NSString *reason);
 static void CRWavRollIfNeeded(CaptureChannel *ch);
 
-// v9.8：边录边回填 WAV 头，让正在写的文件随时可播放。
-// 注意 CRWavFinalize 会把写指针挪到 4/40 字节处，回填后必须重新 seek 到文件尾，
-// 否则后续 fwrite 会从头覆盖音频数据（这是最容易踩的坑）。
-static void CRWavTouchHeader(CaptureChannel *ch) {
-    if (!ch || !ch->wav || ch->wavRate == 0) return;
-    UInt64 step = (UInt64)(kHeaderTouchSecs * ch->wavRate);
-    // ★第一次（wavLastHeaderFrames==0）必须无条件回填：新建文件时 data 长度写的是 0，
-    // 不回填的话播放器会认为时长 0 秒、播不出声。之后才按 2 秒限频。
-    if (ch->wavLastHeaderFrames > 0 && ch->wavFrames < ch->wavLastHeaderFrames + step) return;
-    CRWavFinalize(ch->wav, ch->wavFrames, 1);
-    if (fseek(ch->wav, 0, SEEK_END) != 0) {
-        CRAppLog(@"[录音] ⚠ 回填头后 seek 到文件尾失败，本段剩余数据可能写不进去");
-    }
-    ch->wavLastHeaderFrames = ch->wavFrames;
-}
-
-// 关闭本通文件：回填头 → fclose → 回到"只进内存"的待机状态（下次人声开新文件）
+// 封存当前段：回填头 → 改名 .wav → 回到"只进内存"的待机状态
 static void CRWavSeal(CaptureChannel *ch, NSString *reason) {
     if (!ch || !ch->wav) return;
     UInt64 frames = ch->wavFrames;
     CRWavFinalize(ch->wav, frames, 1);
     fclose(ch->wav);
     ch->wav = NULL;
+    char cur[768], fin[768];
+    snprintf(cur, sizeof(cur), "%s/%s_p%03d.wav.part", ch->wavDir, ch->wavStem, ch->wavPart);
+    snprintf(fin, sizeof(fin), "%s/%s_p%03d.wav", ch->wavDir, ch->wavStem, ch->wavPart);
+    rename(cur, fin);
     int sealed = ch->wavPart;
     ch->wavPart++;
     ch->wavFrames = 0;
-    ch->wavLastHeaderFrames = 0;
     ch->wavNonZero = 0;
     ch->wavSilentFrames = 0;
     ch->wavHadSound = NO;
@@ -470,23 +445,21 @@ static void CRWavSeal(CaptureChannel *ch, NSString *reason) {
     ch->gateBlockN = 0; ch->gateLoudN = 0;
     ch->prerollCount = 0;
     ch->prerollPos = 0;
-    CRAppLog(@"[录音] ⏹ 第%d通结束（%.1f 分钟, %@）→ 回到待机，下次有人说话开新文件",
-             sealed, (double)frames / (double)(ch->wavRate ? ch->wavRate : 1) / 60.0, reason ?: @"—");
+    CRAppLog(@"[录音] ⏹ 第%d段已封存（%.1f秒, %@）→ 回到待机，没说话就不再建文件",
+             sealed, (double)frames / (double)ch->wavRate, reason ?: @"—");
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter] postNotificationName:@"CallRecorderSegmentRolled" object:nil];
     });
 }
 
-// v9.8：只判「这一通有没有结束」，不再按 60 秒 / 15 秒切段。
+// ★v9.10 唯一改动：去掉「满 60 秒封存」，一通电话从头到尾只写一个文件。
+// 结束条件只剩「连续静音 60 秒」—— 一通电话里的几十秒停顿不会切段。
+// 写盘方式保持 v9.7 原样（.part → 封存时 rename），不做边录边回填头，不改采集链路。
 static void CRWavRollIfNeeded(CaptureChannel *ch) {
     if (!ch || !ch->wav || !ch->wavRolling || ch->wavRate == 0) return;
-    // 连续静音 60 秒 → 这一通结束
-    BOOL idleEnded = (ch->wavSilentFrames >= (UInt64)(kIdleCloseSeconds * ch->wavRate));
-    // 单文件硬上限（6 小时）
-    UInt64 maxFrames = (UInt64)(kMaxOneFileHours * 3600.0 * ch->wavRate);
-    BOOL tooBig = (maxFrames > 0 && ch->wavFrames >= maxFrames);
-    if (tooBig)          CRWavSeal(ch, @"单文件达6小时上限");
-    else if (idleEnded)  CRWavSeal(ch, @"静音满60秒，判定这一通已结束");
+    // 不按时间切段：ch->wavRollFrames 在常驻模式下固定为 0，这里不再判 full。
+    BOOL talkEnded = (ch->wavSilentFrames >= (UInt64)(kIdleCloseSeconds * ch->wavRate));
+    if (talkEnded)  CRWavSeal(ch, @"这一通已结束（静音满60秒）");
 }
 
 // v9.7 ★门限重做：旧版 kSoundGatePCM=700 有两个毛病：
@@ -500,18 +473,15 @@ static const SInt16 kSoundGatePCM = 520;   // -46 dBFS：块能量门限（不�
 // 触发所需的连续有声块数：0.1s × 5 = 0.5 秒（原来 0.6 秒，稍放宽）
 static const UInt32 kSoundRunBlocks = 5;
 
-// 打开一个新文件开始录；withPreroll=YES 时把触发前的 2 秒预录补进去。
-// v9.8：★不再写成 .wav.part 再改名 —— 直接建成 .wav，并边录边回填头，
-// 因此从第一秒起它就是一个「可播放」的文件，用不着等封存。
+// 打开一个新的 .wav.part 开始正式录；withPreroll=YES 时把触发前的 2 秒预录补进去
 static void CRWavOpenPart(CaptureChannel *ch, BOOL withPreroll) {
     if (!ch || !ch->wavDir[0]) return;
     char cur[768];
-    snprintf(cur, sizeof(cur), "%s/%s_p%03d.wav", ch->wavDir, ch->wavStem, ch->wavPart);
+    snprintf(cur, sizeof(cur), "%s/%s_p%03d.wav.part", ch->wavDir, ch->wavStem, ch->wavPart);
     FILE *f = fopen(cur, "wb");
     if (!f) { CRAppLog(@"[录音] 无法创建 %s", cur); return; }
     CRWavHeader(f, ch->wavRate, 1);
     ch->wav = f;
-    ch->wavLastHeaderFrames = 0;
     // 触发前的预录数据先刷进去，保证"开口第一句"完整
     if (withPreroll && ch->preroll && ch->prerollCount > 0) {
         UInt32 total = ch->prerollCount;
@@ -529,8 +499,7 @@ static void CRWavOpenPart(CaptureChannel *ch, BOOL withPreroll) {
     ch->prerollPos = 0;
     ch->wavSilentFrames = 0;
     ch->wavHadSound = YES;   // 已经确认有人声，停止时这段必须保留
-    CRAppLog(@"[录音] ▶ 检测到人声 → 开始第%d通（含2秒预录，一路录到底不切段）", ch->wavPart);
-    CRWavTouchHeader(ch);   // 立刻回填一次，文件马上可播
+    CRAppLog(@"[录音] ▶ 检测到人声 → 开始第%d段（含2秒预录，队列不重启）", ch->wavPart);
 }
 
 // 有声音就落盘，没声音就把样本塞进内存环形缓冲。
@@ -702,8 +671,7 @@ static void RecorderCallback(void *ptr, AudioQueueRef aq, AudioQueueBufferRef bu
             fwrite(ch->wavScratch, sizeof(SInt16), outN, ch->wav);
             ch->wavFrames += outN;
         }
-        CRWavTouchHeader(ch);    // v9.8：每 2 秒回填头，正在写的文件随时可播放
-        CRWavRollIfNeeded(ch);   // v9.9：只判"静音满60秒/超6小时"，不按时间切段
+        CRWavRollIfNeeded(ch);   // v9.6：满60秒 / 说完静音15秒 → 封存；没说话就不建文件
     }
     ch->totalBytes += buffer->mAudioDataByteSize;
     ch->callbacks++;
@@ -853,23 +821,22 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     ch->wavOutN = 0; ch->soundRun = 0; ch->gateBlockN = 0; ch->gateLoudN = 0;
 
     if (rolling) {
-        // ===== v9.8 常驻模式：延迟建文件 + 一通电话一个文件 =====
+        // ===== v9.6 常驻模式：延迟建文件，没检测到人声就一个文件都不生成 =====
         snprintf(ch->wavDir, sizeof(ch->wavDir), "%s", dirPath.fileSystemRepresentation);
         snprintf(ch->wavStem, sizeof(ch->wavStem), "%s", stem.UTF8String);
         ch->wavPart = 1;
-        // ★v9.8：wavRollFrames 不再当"每 60 秒切段"用，CRWavRollIfNeeded 只用
-        // "静音 60 秒 / 单文件 6 小时"两个条件关文件，所以这里不再设滚动切段阈值。
+        // ★v9.10：wavRollFrames 固定 0 = 不按时间切段，一通电话只写一个文件。
+        // rollFrames 参数只作为「是否启用常驻懒建文件」的开关（非 0 即启用）。
         ch->wavRollFrames = 0;
         ch->wavRolling = YES;
         ch->wavLazy = YES;
         ch->wav = NULL;
-        ch->wavLastHeaderFrames = 0;
         // 2 秒预录环形缓冲：检测到人声时把这段先补进去，开口第一句不丢
         ch->prerollCap = (UInt32)(2.0 * rate);
         if (ch->prerollCap < 1024) ch->prerollCap = 1024;
         ch->preroll = (SInt16 *)calloc(ch->prerollCap, sizeof(SInt16));
         ch->prerollCount = 0; ch->prerollPos = 0;
-        CRAppLog(@"[WAV] 常驻待机 v9.9：不建文件，只在内存留2秒预录；检测到人声才落盘 → %@_pNNN.wav（一通电话一个文件）", stem);
+        CRAppLog(@"[WAV] 常驻待机：不建文件，只在内存留2秒预录；检测到人声才落盘 → %@_pNNN.wav", stem);
     } else {
         // ===== 手动单点录音：立即建文件（用户已明确按下按钮，就是要录） =====
         NSString *actual = url.path;
@@ -972,8 +939,7 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     ch->audioFile = 0;
     ch->currentPacket = 0;
     // WAV 在 Start 之前挂好；★v9.6 常驻模式只是登记"待机"，不立即建文件
-    // v9.8：传非 0 即可（表示启用常驻懒建文件），具体关闭条件由 CRWavRollIfNeeded 决定
-    UInt64 rollFrames = 1;
+    UInt64 rollFrames = (UInt64)(60.0 * kTapSampleRate / down);
     if (![self attachWavOutput:wavURL toChannel:ch down:down rollFrames:rollFrames]) {
         if (error) *error = [NSError errorWithDomain:@"RecorderEngine" code:-5
                              userInfo:@{NSLocalizedDescriptionKey:@"无法创建 WAV 文件"}];
@@ -1005,8 +971,7 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     NSURL *dir = [fileURL URLByDeletingLastPathComponent];
     NSURL *micURL = [dir URLByAppendingPathComponent:[stem stringByAppendingString:@"_mic.wav"]];
     _micURL = micURL;
-    // v9.8：传非 0 即可（表示启用常驻懒建文件），具体关闭条件由 CRWavRollIfNeeded 决定
-    UInt64 rollFrames = 1;
+    UInt64 rollFrames = (UInt64)(60.0 * kTapSampleRate / down);
 
     // ================= v9.7 ★回归 v6.0 配方（用户实测 v6.0 通话能自动录音）=================
     // v6.0 能录、v9.4 之后不能录的唯一结构性差异：
@@ -1285,10 +1250,17 @@ static void CalcBufSize(AudioQueueRef q, AudioStreamBasicDescription desc, UInt3
     if (ch->extFile) { ExtAudioFileDispose(ch->extFile); ch->extFile = NULL; }
     if (ch->queue) { AudioQueueDispose(ch->queue, true); ch->queue = NULL; }
     // v9.2：所有回调都结束后，回填 WAV 头长度并关闭
-    // v9.8：文件从创建起就叫 .wav（边录边回填头），所以停止时只需回填 + fclose，
-    // 不再有 .part → .wav 的改名动作。懒建文件模式下 ch->wav 可能为 NULL（全程没人说话）。
+    // v9.5：滚动模式下把正在写的 .part 封存成可直接播放的 .wav
+    // v9.6：懒建文件模式下 ch->wav 可能为 NULL（全程没人说话），此时什么都不用做
     if (ch->wav) {
         CRWavFinalize(ch->wav, ch->wavFrames, 1); fclose(ch->wav); ch->wav = NULL;
+        if (ch->wavRolling) {
+            char cur[768], fin[768];
+            snprintf(cur, sizeof(cur), "%s/%s_p%03d.wav.part", ch->wavDir, ch->wavStem, ch->wavPart);
+            snprintf(fin, sizeof(fin), "%s/%s_p%03d.wav", ch->wavDir, ch->wavStem, ch->wavPart);
+            if (ch->wavHadSound) rename(cur, fin);
+            else remove(cur);
+        }
     }
     if (ch->wavScratch) { free(ch->wavScratch); ch->wavScratch = NULL; }
     if (ch->preroll) { free(ch->preroll); ch->preroll = NULL; }
